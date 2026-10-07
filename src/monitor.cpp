@@ -33,8 +33,7 @@ void Monitor::poll(std::vector<MonitorSensor>& sensors, bmc::EventLogger& logger
             if (decision.active) {
                 // 请求复制配置快照；任务只引用生命周期长于线程池的基础服务。
                 const bmc::RecoveryRequest request{decision.rule, event.id, decision.action, decision.sequence, sensor.config.action_path};
-                if (!worker.submit([request, &recovery, &logger, &sel, &bus, &worker_failed] {
-                    try {
+                if (!worker.submit([request, &recovery, &logger, &sel, &bus] {
                         const auto result = recovery.submit(request);
                         if (result) {
                             const auto detail = result->detail + ": attempts=" + std::to_string(result->attempts);
@@ -42,7 +41,6 @@ void Monitor::poll(std::vector<MonitorSensor>& sensors, bmc::EventLogger& logger
                             sel.append(request.sensor, "recovery", detail);
                             bus.publish({bmc::BusEventType::recovery, request.sensor, detail, std::nullopt});
                         }
-                    } catch (...) { worker_failed.store(true); }
                 }, 10)) logger.action(decision.rule, "rejected: recovery queue full");
             } else {
                 recovery.reset(event.id);
