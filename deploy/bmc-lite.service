@@ -1,0 +1,20 @@
+[Unit]
+Description=BMC-Lite hardware monitor
+After=local-fs.target
+
+[Service]
+Type=simple
+User=bmc-lite
+Group=bmc-lite
+WorkingDirectory=/opt/bmc-lite
+ExecStart=/opt/bmc-lite/bmc-lite --config /opt/bmc-lite/config/hardware.conf --rules /opt/bmc-lite/config/rules.conf --sel /var/log/bmc-lite/sel.db --log /var/log/bmc-lite/faults.jsonl
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/bmc-lite
+
+[Install]
+WantedBy=multi-user.target

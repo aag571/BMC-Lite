@@ -1,0 +1,6 @@
+cpu_temp sysfs /sys/class/hwmon/hwmon0/temp1_input 0.001 high 70 90 3 3 3 /sys/class/hwmon/hwmon1/pwm1
+fan_rpm sysfs /sys/class/hwmon/hwmon1/fan1_input 1 low 1500 500 100 3 3 -
+i2c_word i2c /dev/i2c-1,0x48,0x00 1 high 70 90 3 3 3 -
+
+# Linux GPIO v2 character-device input: chip,offset[,active-low]
+# gpio_fault gpio /dev/gpiochip0,23,active-low 1 high 0.5 1 0 1 1 -

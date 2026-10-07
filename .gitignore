@@ -1,0 +1,8 @@
+build*/
+var/
+release-stage*/
+*.tar.gz
+*.tar.gz.sha256
+bmc-lite-staging/
+__pycache__/
+*.pyc
