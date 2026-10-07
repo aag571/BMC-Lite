@@ -15,7 +15,7 @@ std::vector<MonitorSensor> prepare_sensors(const std::string& path) {
     return result;
 }
 void Monitor::poll(std::vector<MonitorSensor>& sensors, bmc::EventLogger& logger, bmc::Worker& worker,
-            bmc::EventBus& bus, bmc::FaultRuleEngine& rules, bmc::RecoveryPolicyEngine& recovery, bmc::SelStore& sel, std::atomic_bool& worker_failed) {
+            bmc::EventBus& bus, bmc::FaultRuleEngine& rules, bmc::RecoveryPolicyEngine& recovery, bmc::SelStore& sel, std::atomic_bool&) {
     for (auto& sensor : sensors) {
         // 每次采样都评估规则，只有状态变化才写入故障历史，避免日志无限重复。
         const auto value = sensor.device->read_value();

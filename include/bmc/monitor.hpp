@@ -18,6 +18,6 @@ class Monitor {
 public:
     void poll(std::vector<MonitorSensor>& sensors, EventLogger& logger, Worker& worker,
               EventBus& bus, FaultRuleEngine& rules, RecoveryPolicyEngine& recovery,
-              SelStore& sel, std::atomic_bool& worker_failed);
+              SelStore& sel, std::atomic_bool&);
 };
 }
