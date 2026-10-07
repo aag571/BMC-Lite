@@ -2,7 +2,7 @@
 
 ## 目录与构建目标
 
-include/bmc/core.hpp 定义领域契约与基础服务；src/core.cpp 实现领域与基础设施；src/main.cpp 编排 Linux 事件循环；tests 覆盖领域与硬件读写；tools/generate_matrix.py 产生确定性 GoogleTest 边界矩阵；config 包含模拟和实机示例。
+include/bmc/core.hpp 定义领域契约与基础服务；src 下按职责拆分配置、状态机、设备、日志、线程与服务编排；src/main.cpp 编排 Linux 事件循环；tests 覆盖领域与硬件读写；tools/generate_matrix.py 产生确定性 GoogleTest 边界矩阵；config 包含模拟和实机示例。
 
 CMake 提供 bmc_core 静态库、bmc-lite 程序和 bmc_tests 测试目标，使用 target-based CMake、Threads 与 GoogleTest。测试依赖采用固定版本 FetchContent，不把依赖行数计入项目。
 

@@ -20,21 +20,19 @@ void Monitor::poll(std::vector<MonitorSensor>& sensors, bmc::EventLogger& logger
         // 每次采样都评估规则，只有状态变化才写入故障历史，避免日志无限重复。
         const auto value = sensor.device->read_value();
         const auto transition = sensor.engine.update(value);
-        const bmc::Event snapshot{sensor.config.id, sensor.engine.state(), sensor.engine.state(), value, "sample", 0};
-        const auto event = transition ? transition : std::optional<bmc::Event>(snapshot);
-        if (transition) {
-            logger.write(*event);
-            sel.append(event->id, bmc::name(event->after), event->reason, event->value);
-            bus.publish({bmc::BusEventType::sensor_state, event->id, bmc::name(event->after), event->value});
-        }
-        for (const auto& decision : rules.evaluate(*event)) {
+        if (!transition) continue;
+        const auto& event = *transition;
+        logger.write(event);
+        sel.append(event.id, bmc::name(event.after), event.reason, event.value);
+        bus.publish({bmc::BusEventType::sensor_state, event.id, bmc::name(event.after), event.value});
+        for (const auto& decision : rules.evaluate(event)) {
             const auto message = std::string(decision.active ? "activated:" : "cleared:") + decision.action;
             logger.action(decision.rule, message);
-            sel.append(decision.rule, decision.active ? "active" : "clear", message, event->value);
-            bus.publish({bmc::BusEventType::recovery, decision.rule, message, event->value});
+            sel.append(decision.rule, decision.active ? "active" : "clear", message, event.value);
+            bus.publish({bmc::BusEventType::recovery, decision.rule, message, event.value});
             if (decision.active) {
                 // 请求复制配置快照；任务只引用生命周期长于线程池的基础服务。
-                const bmc::RecoveryRequest request{decision.rule, event->id, decision.action, decision.sequence, sensor.config.action_path};
+                const bmc::RecoveryRequest request{decision.rule, event.id, decision.action, decision.sequence, sensor.config.action_path};
                 if (!worker.submit([request, &recovery, &logger, &sel, &bus, &worker_failed] {
                     try {
                         const auto result = recovery.submit(request);
@@ -47,10 +45,10 @@ void Monitor::poll(std::vector<MonitorSensor>& sensors, bmc::EventLogger& logger
                     } catch (...) { worker_failed.store(true); }
                 }, 10)) logger.action(decision.rule, "rejected: recovery queue full");
             } else {
-                recovery.reset(event->id);
+                recovery.reset(event.id);
             }
         }
-        if (transition) std::cout << event->id << ": " << bmc::name(event->before) << " -> " << bmc::name(event->after) << '\n';
+        std::cout << event.id << ": " << bmc::name(event.before) << " -> " << bmc::name(event.after) << '\n';
     }
 }
 

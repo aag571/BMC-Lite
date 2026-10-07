@@ -10,7 +10,9 @@ require() {
 }
 require CMakeLists.txt
 require include/bmc/core.hpp
-require src/core.cpp
+require src/engine.cpp
+require src/monitor.cpp
+require src/readers.cpp
 require src/main.cpp
 require config/mock.conf
 require config/hardware.conf.example
