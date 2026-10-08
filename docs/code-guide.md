@@ -16,7 +16,8 @@
 - main.cpp：参数解析、应用依赖构造、Linux epoll/timerfd/signalfd 调度和重载。
 - worker.cpp：有界任务队列和线程生命周期。
 - event_bus.cpp：异步通知、类型过滤和背压。
-- logger.cpp、sel.cpp：滚动日志与事件存储。
+- logger.cpp、sel.cpp：滚动日志与事件存储。两者都用常驻描述符与批量写入（`LogPolicy` / `Truncate`）；
+  日志默认不 fsync 且轮转前先落盘当前分片，SEL 对关键证据立即 `write+fdatasync` 并在启动时修复尾部残缺记录。
 - fd.cpp：独占文件描述符所有权和移动语义。
 - linux_io.cpp：系统调用注入层（PosixLinuxIo + 进程级默认实例）。
 

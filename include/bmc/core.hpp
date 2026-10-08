@@ -267,23 +267,47 @@ public:
     virtual void write(const Event& event) = 0;
     virtual void action(const std::string& id, const std::string& result) = 0;
 };
+// 日志写入策略。日志的故障证据价值高于采样末端的 SEL，但仍允许在崩溃时丢掉少量尾部行，
+// 因此默认批量合并写入与不 fsync，需要更强保证时可显式打开。
+struct LogPolicy {
+    // 累积到该字节数就落盘，避免每行一次 write。
+    std::size_t batch_bytes = 4096;
+    // 每次落盘后是否 fsync（默认关闭：崩溃可能丢最后一批）。
+    bool sync = false;
+    // 未落盘缓冲区的上限，超过后丢弃最旧内容并计数。
+    std::size_t pending_cap = 1u << 20;
+};
 class Logger : public EventLogger {
 public:
-    Logger(std::filesystem::path path, std::uintmax_t limit = 1048576, unsigned keep = 3);
+    // sync=true 时每条记录立即落盘并 fsync，等价于旧行为，用于需要强持久的场景。
+    Logger(std::filesystem::path path, std::uintmax_t limit = 1048576, unsigned keep = 3,
+           bool sync = false, std::size_t batch_bytes = 4096);
     ~Logger();
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
     void write(const Event& event) override;
     void action(const std::string& id, const std::string& result) override;
+    // 把未落盘缓冲区写入磁盘；缓冲区仍非空时返回 false。
+    bool flush();
+    std::size_t pending_bytes() const;
+    std::uint64_t write_failures() const;
+    std::uint64_t dropped_bytes() const;
 private:
     void append(const std::string& line);
-    void rotate(std::size_t incoming);
+    bool rotate(std::size_t incoming);
     void open();
+    bool drain(bool sync);
+    // 返回是否真的丢弃了最旧内容（只有丢弃时才计一次失败）。
+    bool drop_oldest_excess();
     std::filesystem::path path_;
     std::uintmax_t limit_;
     unsigned keep_;
+    LogPolicy policy_;
+    std::string pending_;
+    std::uint64_t write_failures_ = 0;
+    std::uint64_t dropped_bytes_ = 0;
     int descriptor_ = -1;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
 };
 class Worker {
 public:

@@ -878,7 +878,103 @@ TEST(Sel, WriteFailureDegradesInsteadOfTerminating) {
     }
     ::close(ends[0]);
     ::close(ends[1]);
-}TEST(Sel, LoggerRotatesThroughPersistentDescriptor) {
+}
+TEST(Logger, BatchesWritesIntoFewerSyscalls) {
+    const auto path = temporary("-log-batch");
+    std::filesystem::remove(path);
+    {
+        // 一条 action 记录约 61 字节；批次阈值 96 意味着第二条记录会触发落盘。
+        bmc::Logger logger(path, 1u << 20, 2, false, 96);
+        logger.action("sensor", "first");
+        // 单条记录不足以触发批次阈值，应仍在缓冲区。
+        EXPECT_GT(logger.pending_bytes(), 0u);
+        EXPECT_EQ(logger.write_failures(), 0u);
+        // 第二条把缓冲区推过阈值，自动落盘。
+        logger.action("sensor", "second");
+        EXPECT_EQ(logger.pending_bytes(), 0u);
+        EXPECT_EQ(logger.write_failures(), 0u);
+        logger.action("sensor", "third");
+        EXPECT_GT(logger.pending_bytes(), 0u);
+        EXPECT_TRUE(logger.flush());
+        EXPECT_EQ(logger.pending_bytes(), 0u);
+    }
+    std::ifstream input(path);
+    int lines = 0;
+    std::string line;
+    while (std::getline(input, line)) {
+        EXPECT_EQ(line.front(), '{');
+        EXPECT_EQ(line.back(), '}');
+        ++lines;
+    }
+    EXPECT_EQ(lines, 3);
+    std::filesystem::remove(path);
+}
+TEST(Logger, SyncPolicyWritesEveryRecordImmediately) {
+    const auto path = temporary("-log-sync");
+    std::filesystem::remove(path);
+    {
+        // sync=true 等价于旧行为：每条记录立即落盘。
+        bmc::Logger logger(path, 1u << 20, 2, true);
+        logger.action("sensor", "first");
+        EXPECT_EQ(logger.pending_bytes(), 0u);
+        EXPECT_EQ(logger.write_failures(), 0u);
+        logger.action("sensor", "second");
+        EXPECT_EQ(logger.pending_bytes(), 0u);
+    }
+    bmc::Logger reopened(path, 1u << 20, 2, true);
+    EXPECT_EQ(reopened.write_failures(), 0u);
+    std::ifstream input(path);
+    int lines = 0;
+    std::string line;
+    while (std::getline(input, line)) {
+        ++lines;
+    }
+    EXPECT_EQ(lines, 2);
+    std::filesystem::remove(path);
+}
+TEST(Logger, BoundedPendingAndFailureCounting) {
+    const auto path = temporary("-log-pending");
+    std::filesystem::remove(path);
+    {
+        // 批次阈值设得极大，记录只会堆在缓冲区里，便于观察上限与失败计数。
+        bmc::Logger logger(path, 1u << 20, 2, false, 1u << 20);
+        const std::string filler(1024, 'x');
+        for (unsigned index = 0; index < 256; ++index) {
+            EXPECT_NO_THROW(logger.action("sensor", "entry-" + std::to_string(index) + filler));
+        }
+        EXPECT_EQ(logger.write_failures(), 0u);
+        EXPECT_TRUE(logger.flush());
+        EXPECT_EQ(logger.pending_bytes(), 0u);
+        EXPECT_EQ(logger.dropped_bytes(), 0u);
+    }
+    std::filesystem::remove(path);
+}
+TEST(Logger, WriteFailureIsCountedAndNeverThrows) {
+    // 填满的管道 + O_NONBLOCK：每次 write 都以 EAGAIN 失败。日志不再逐行抛异常终止服务，
+    // 而是计入失败次数；SEL 侧的同名语义已经覆盖，这里确认日志侧一致。
+    int ends[2] = {-1, -1};
+    ASSERT_EQ(::pipe(ends), 0);
+    ASSERT_NE(::fcntl(ends[1], F_SETFL, ::fcntl(ends[1], F_GETFL) | O_NONBLOCK), -1);
+    const std::string filler(4096, 'x');
+    for (;;) {
+        const auto written = ::write(ends[1], filler.data(), filler.size());
+        if (written <= 0) {
+            break;
+        }
+    }
+    const std::string target = "/proc/self/fd/" + std::to_string(ends[1]);
+    {
+        bmc::Logger logger(target, 1u << 20, 2);
+        for (unsigned index = 0; index < 3; ++index) {
+            EXPECT_NO_THROW(logger.action("sensor", "entry-" + std::to_string(index)));
+        }
+        EXPECT_GT(logger.write_failures(), 0u);
+        EXPECT_FALSE(logger.flush());
+    }
+    ::close(ends[0]);
+    ::close(ends[1]);
+}
+TEST(Logger, RotatesThroughPersistentDescriptor) {
     const auto path = temporary("-log-fd");
     {
         bmc::Logger logger(path, 200, 2);
