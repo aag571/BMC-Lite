@@ -9,7 +9,7 @@ find_package(Threads REQUIRED)
 add_library(bmc_core src/sel.cpp src/state.cpp src/event_bus.cpp src/fd.cpp
   src/config.cpp src/rules.cpp src/recovery.cpp src/engine.cpp src/readers.cpp
   src/logger.cpp src/worker.cpp src/actions.cpp src/monitor.cpp src/linux_io.cpp
-  src/calibration.cpp src/chips.cpp src/cli.cpp src/socket_io.cpp src/http.cpp)
+  src/calibration.cpp src/chips.cpp src/cli.cpp src/socket_io.cpp src/http.cpp src/json.cpp src/service.cpp)
 target_include_directories(bmc_core PUBLIC include)
 target_link_libraries(bmc_core PUBLIC Threads::Threads)
 target_compile_options(bmc_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
@@ -39,7 +39,7 @@ if(BUILD_TESTING)
   add_executable(bmc_tests tests/core_test.cpp)
   target_link_libraries(bmc_tests PRIVATE bmc_core GTest::gtest_main)
   # 测试直接使用 bmc/action.hpp 与 bmc/linux_io.hpp，显式声明而非依赖传递包含。
-  target_include_directories(bmc_tests PRIVATE include)
+  target_include_directories(bmc_tests PRIVATE include tests)
   include(GoogleTest)
   gtest_discover_tests(bmc_tests)
   add_executable(bmc_stress tests/stress_test.cpp)

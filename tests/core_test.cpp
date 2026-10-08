@@ -3,7 +3,9 @@
 #include "bmc/chip.hpp"
 #include "bmc/cli.hpp"
 #include "bmc/http.hpp"
+#include "bmc/service.hpp"
 #include "bmc/socket_io.hpp"
+#include "tests/service_vectors.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1659,5 +1661,151 @@ TEST(RateLimiter, RejectsInvalidConfiguration) {
     EXPECT_THROW(bmc::http::RateLimiter(0, 1.0, 4), std::invalid_argument);
     EXPECT_THROW(bmc::http::RateLimiter(1, -1.0, 4), std::invalid_argument);
     EXPECT_THROW(bmc::http::RateLimiter(1, 1.0, 0), std::invalid_argument);
+}
+
+// ---- Read-only service: byte-for-byte parity with tools/bmc_manage.py ----
+// The golden vectors come from tools/gen_service_vectors.py, which runs the reference
+// Python implementation, so these tests fail if the C++ output drifts even by one byte.
+
+TEST(ReadOnlyService, JsonWriterMatchesPythonDumpsFormatting) {
+    // Separators are ", " and ": "; integral floats print without a fractional part.
+    EXPECT_EQ(bmc::JsonWriter::dump(bmc::JsonWriter::Value::of(95.0)), "95");
+    EXPECT_EQ(bmc::JsonWriter::dump(bmc::JsonWriter::Value::of(41.5)), "41.5");
+    EXPECT_EQ(bmc::JsonWriter::dump(bmc::JsonWriter::Value::of(0.125)), "0.125");
+    EXPECT_EQ(bmc::JsonWriter::dump(bmc::JsonWriter::Value::of(static_cast<std::int64_t>(1700000000000))),
+              "1700000000000");
+    EXPECT_EQ(bmc::JsonWriter::dump(bmc::JsonWriter::Value::null()), "null");
+    EXPECT_EQ(bmc::JsonWriter::dump(bmc::JsonWriter::Value::of(false)), "false");
+    // Quotes and backslashes are escaped; non-ASCII is passed through (ensure_ascii=False).
+    EXPECT_EQ(bmc::JsonWriter::dump(bmc::JsonWriter::Value::of(std::string("odd\"sensor"))), "\"odd\\\"sensor\"");
+    EXPECT_EQ(bmc::JsonWriter::dump(bmc::JsonWriter::Value::of(std::string("a\\b"))), "\"a\\\\b\"");
+    EXPECT_EQ(bmc::JsonWriter::dump(bmc::JsonWriter::Value::of(std::string("\xe6\xb8\xa9\xe5\xba\xa6"))), "\"\xe6\xb8\xa9\xe5\xba\xa6\"");
+    EXPECT_EQ(bmc::JsonWriter::dump(bmc::JsonWriter::Value::of(std::string("a\nb"))), "\"a\\nb\"");
+    // Member insertion order is preserved.
+    const auto document = bmc::JsonWriter::Value::object()
+        .set("b", bmc::JsonWriter::Value::of(static_cast<std::int64_t>(1)))
+        .set("a", bmc::JsonWriter::Value::of(std::string("x")));
+    EXPECT_EQ(bmc::JsonWriter::dump(document), "{\"b\": 1, \"a\": \"x\"}");
+    // NaN/Infinity are rejected rather than written as invalid JSON.
+    EXPECT_THROW(bmc::JsonWriter::number(std::numeric_limits<double>::quiet_NaN()), std::invalid_argument);
+    EXPECT_THROW(bmc::JsonWriter::number(std::numeric_limits<double>::infinity()), std::invalid_argument);
+}
+
+TEST(ReadOnlyService, ResourcesMatchTheReferenceImplementationByteForByte) {
+    ASSERT_FALSE(kResourceVectors.empty());
+    for (const auto& [path, expected] : kResourceVectors) {
+        const auto body = bmc::readonly::resource(path, kVectorEntries);
+        if (expected.empty()) {
+            EXPECT_FALSE(body.has_value()) << "expected 404 for " << path;
+            continue;
+        }
+        ASSERT_TRUE(body.has_value()) << "expected a resource for " << path;
+        EXPECT_EQ(bmc::JsonWriter::dump(*body), expected) << "mismatch for " << path;
+    }
+}
+
+TEST(ReadOnlyService, MetricsMatchTheReferenceImplementationByteForByte) {
+    EXPECT_EQ(bmc::readonly::metrics(kVectorEntries), kMetricsVector);
+}
+
+TEST(ReadOnlyService, HandleDispensesStatusContentTypeAndBody) {
+    const auto metrics = bmc::readonly::handle("/metrics", kVectorEntries);
+    EXPECT_EQ(metrics.status, 200);
+    EXPECT_EQ(metrics.content_type, "text/plain; version=0.0.4; charset=utf-8");
+    EXPECT_EQ(metrics.body, kMetricsVector);
+
+    const auto entries = bmc::readonly::handle("/redfish/v1/Managers/BMC/LogServices/SEL/Entries", kVectorEntries);
+    EXPECT_EQ(entries.status, 200);
+    EXPECT_EQ(entries.content_type, "application/json; charset=utf-8");
+    ASSERT_GE(kResourceVectors.size(), 6u);
+    EXPECT_EQ(entries.body, kResourceVectors[5].second);
+
+    // Unknown paths return the same error body as the reference implementation.
+    const auto missing = bmc::readonly::handle("/nope", kVectorEntries);
+    EXPECT_EQ(missing.status, 404);
+    EXPECT_EQ(missing.body,
+              "{\"error\": {\"code\": \"ResourceNotFound\", \"message\": \"Unknown resource\"}}");
+
+    // A query string is ignored, matching urlsplit(path).path.
+    const auto with_query = bmc::readonly::handle("/redfish/v1/?x=1", kVectorEntries);
+    EXPECT_EQ(with_query.status, 200);
+    EXPECT_EQ(with_query.body, kResourceVectors[0].second);
+
+    // /healthz is a local probe and is not a Redfish resource.
+    const auto health = bmc::readonly::handle("/healthz", {});
+    EXPECT_EQ(health.status, 200);
+    EXPECT_EQ(health.body, "ok\n");
+}
+
+TEST(ReadOnlyService, RenderedResponseCarriesLengthAndNoStore) {
+    const auto response = bmc::readonly::handle("/healthz", {});
+    const auto text = response.render();
+    EXPECT_EQ(text.rfind("HTTP/1.1 200 OK\r\n", 0), 0u);
+    EXPECT_NE(text.find("Content-Type: text/plain; charset=utf-8\r\n"), std::string::npos);
+    EXPECT_NE(text.find("Content-Length: 3\r\n"), std::string::npos);
+    EXPECT_NE(text.find("Cache-Control: no-store\r\n"), std::string::npos);
+    // Content-Length must equal the real body length or the client hangs.
+    const auto separator = text.find("\r\n\r\n");
+    ASSERT_NE(separator, std::string::npos);
+    EXPECT_EQ(text.size() - (separator + 4), response.body.size());
+    EXPECT_EQ(bmc::readonly::handle("/nope", {}).render().find("HTTP/1.1 404 Not Found\r\n"), 0u);
+}
+
+TEST(ReadOnlyService, SelParsingRoundTripsThroughTheFileFormat) {
+    const auto path = temporary("-service.sel");
+    std::filesystem::remove(path);
+    {
+        // Write through the real SelStore so the parser sees production encoding.
+        bmc::SelStore store(path, 1000);
+        for (const auto& entry : kVectorEntries) {
+            store.append(entry.sensor, entry.state, entry.message, entry.value);
+        }
+        ASSERT_TRUE(store.flush());
+    }
+    const auto parsed = bmc::read_sel_entries(path.string());
+    ASSERT_EQ(parsed.size(), kVectorEntries.size());
+    for (std::size_t index = 0; index < parsed.size(); ++index) {
+        EXPECT_EQ(parsed[index].sensor, kVectorEntries[index].sensor);
+        EXPECT_EQ(parsed[index].state, kVectorEntries[index].state);
+        EXPECT_EQ(parsed[index].message, kVectorEntries[index].message);
+        EXPECT_EQ(parsed[index].value.has_value(), kVectorEntries[index].value.has_value());
+        if (parsed[index].value && kVectorEntries[index].value) {
+            EXPECT_NEAR(*parsed[index].value, *kVectorEntries[index].value, 1e-12);
+        }
+    }
+    for (std::size_t index = 1; index < parsed.size(); ++index) {
+        EXPECT_GT(parsed[index].id, parsed[index - 1].id);
+    }
+    std::filesystem::remove(path);
+}
+
+TEST(ReadOnlyService, SelParsingSkipsUnreadableLinesAndBoundsTheWindow) {
+    const auto path = temporary("-service-broken.sel");
+    std::filesystem::remove(path);
+    {
+        std::ofstream output(path);
+        output << "1 1700000000000 \"cpu\" \"normal\" \"ok\" 41.5\n";
+        output << "not a valid record\n";
+        output << "2 1700000001000 \"cpu\" \"warning\"\n";
+        output << "x 1700000002000 \"cpu\" \"normal\" \"ok\" 1\n";
+        output << "3 1700000003000 \"cpu\" \"normal\" \"ok\" null\n";
+        output << "4 1700000004000 \"cpu\" \"normal\" \"ok\" nope\n";
+        output << "\n";
+    }
+    const auto parsed = bmc::read_sel_entries(path.string());
+    ASSERT_EQ(parsed.size(), 2u);
+    EXPECT_EQ(parsed[0].sensor, "cpu");
+    EXPECT_TRUE(parsed[0].value.has_value());
+    EXPECT_NEAR(*parsed[0].value, 41.5, 1e-12);
+    EXPECT_FALSE(parsed[1].value.has_value());
+    // max_records keeps only the most recent records.
+    const auto windowed = bmc::read_sel_entries(path.string(), 1);
+    ASSERT_EQ(windowed.size(), 1u);
+    EXPECT_EQ(windowed.front().sensor, "cpu");
+    EXPECT_FALSE(windowed.front().value.has_value());
+    // A missing file is not an error.
+    EXPECT_TRUE(bmc::read_sel_entries(
+        (std::filesystem::temp_directory_path() / "definitely-missing.sel").string()).empty());
+    std::filesystem::remove(path);
 }
 }
