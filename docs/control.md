@@ -1,8 +1,9 @@
 # 控制面安装与使用
 
 控制服务已接入 daemon，默认关闭。只有同时配置端口和有效令牌文件才监听。
-凭证、证书、权限或绑定检查失败时不创建控制监听；监控仍继续采样，结束时返回退出码 1，
-stderr 和日志记录原因。只读 HTTP 与控制使用不同端口。
+凭证、证书、权限或绑定检查失败时，daemon 立即以非零状态退出，stderr 和日志记录原因；
+运行期间控制监听或审计失效也会触发非零退出，便于 systemd 按 Restart=on-failure 重启。
+只读 HTTP 与控制使用不同端口，其绑定失败仍允许监控继续采样。
 
 ## 1. 从源码构建
 
@@ -57,7 +58,7 @@ rm /tmp/bmc-key.pem
 ```
 
 将 cert.pem 复制到调用客户端。用 --cacert 验证证书链与 URL 主机名/IP；不使用 curl -k。
-控制面使用服务器证书加 Bearer 认证；独立心跳提供验证 CA/主机名的出站 TLS，不使用客户端证书认证。
+这里实现的是服务器证书加 Bearer 认证，没有实现客户端证书认证或出站 TLS。
 证书与令牌在启动时读取，轮换后重启服务。
 
 ## 3. 开启 systemd 服务
@@ -86,7 +87,8 @@ curl http://127.0.0.1:8000/healthz
 
 只读服务仍绑定回环。若显式需要远程只读 HTTP，增加 --http-bind 0.0.0.0 --http-allow-remote。
 控制面最多 8 个连接，读取、写入与 TLS 握手都有期限，认证失败按来源 IP 限流，
-重新连接换源端口不能绕过限流。非回环明文控制绑定会被拒绝。
+重新连接换源端口不能绕过限流。来源表满时淘汰最旧来源，避免新管理员永久被锁在表外。
+非回环明文控制绑定会被拒绝。
 
 ## 4. 发起控制请求
 
@@ -118,7 +120,9 @@ sensor 必须是当前配置中存在的 ID；风扇动作还需配置 action_pa
 
 状态码：200 查询成功；202 排队；400 请求/传感器/动作不合法；401 认证失败；
 429 认证失败次数超限；503 队列满或审计无法持久化。
-SEL 保存 accepted/rejected/unauthorized/rate-limited、action、sensor、peer、request_id。
+SEL 保存 requested/accepted/rejected/unauthorized/rate-limited、action、sensor、peer、request_id。
+动作先记录 requested，成功排队后才记录 accepted；审计未成功持久化时不会执行动作。
+同一 request_id 后续还会记录实际恢复结果。SEL 的普通文件 fdatasync 仍可能受磁盘延迟影响。
 accepted 请求验证记录与异步执行结果可通过 request_id 关联，执行结果 detail 可为 completed、cooldown 或 failed。
 accepted 验证记录之后也可能出现队列拒绝或动作失败，必须查看异步结果。
 

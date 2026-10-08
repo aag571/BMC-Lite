@@ -1,5 +1,7 @@
 # BMC-Lite — Installation and User Guide
 
+With control enabled, invalid token, TLS or bind settings make the daemon exit immediately with a nonzero status. Runtime listener or audit failures also exit so systemd can restart it. SEL opens its descriptor nonblocking, although regular-file fdatasync can still incur disk latency. Peer stale/recovered reports enter the bounded event bus and are best effort if its queue is full.
+
 [中文手册](README.md)
 
 The daemon includes optional read-only HTTP and control services, disabled by default. See the [control guide](docs/control.en.md) for TLS builds, release installation, credentials, systemd setup, requests and auditing.

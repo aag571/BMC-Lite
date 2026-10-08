@@ -74,6 +74,11 @@ int run(const bmc::CliOptions& settings) {
     bus.subscribe(bmc::BusEventType::sensor_state, [&logger](const bmc::BusEvent& event) {
         logger.action(event.source, "event-bus:" + event.message);
     });
+    bus.subscribe(bmc::BusEventType::service, [&sel, &logger](const bmc::BusEvent& event) {
+        if (event.source != "peer") return;
+        sel.append("peer", "service", event.message, std::nullopt, true);
+        logger.action("peer", event.message);
+    });
     std::atomic_bool worker_failed = false;
     // 进程唯一的系统调用入口：设备读取与动作写入都经它注入，测试可替换为 FakeLinuxIo。
     bmc::PosixLinuxIo io;
@@ -96,7 +101,6 @@ int run(const bmc::CliOptions& settings) {
     // 声明顺序保证异常退出时也先停止控制网络，再销毁回调与基础服务。
     std::unique_ptr<bmc::ControlService> control;
     std::unique_ptr<bmc::ReadOnlyServer> control_network;
-    bool control_started = true;
     std::uint64_t config_generation = 1;
     auto configure_control = [&] {
         if (!control) return;
@@ -125,23 +129,20 @@ int run(const bmc::CliOptions& settings) {
             std::string error;
             if (!control_network->start(error)) throw std::runtime_error(error);
         } catch (const std::exception& error) {
-            control_started = false;
             if (control_network) control_network->stop();
-            std::cerr << "bmc-lite: control unavailable: " << error.what() << '\n';
             logger.action("control", std::string("listener unavailable: ") + error.what());
+            throw std::runtime_error(std::string("control unavailable: ") + error.what());
         }
     }
     std::atomic<std::uint64_t> sample_count{0};
     std::unique_ptr<bmc::PeerHeartbeat> peer;
     std::unique_ptr<bmc::ReadOnlyServer> peer_network;
-    bool peer_started = true;
     if (!settings.peer_address.empty()) {
         try {
             peer = std::make_unique<bmc::PeerHeartbeat>(settings.peer_address, settings.peer_port,
                 bmc::load_control_token(settings.peer_token_file), std::chrono::milliseconds(settings.peer_interval_ms),
-                std::chrono::milliseconds(settings.peer_stale_ms), [&sel, &logger, &bus](const std::string& message) {
-                    sel.append("peer", "service", message, std::nullopt, true);
-                    logger.action("peer", message);
+                std::chrono::milliseconds(settings.peer_stale_ms), [&bus](const std::string& message) {
+                    // 心跳线程只投递有界事件；磁盘写入由事件总线线程处理。
                     bus.publish({bmc::BusEventType::service, "peer", message, std::nullopt});
                 }, settings.peer_ca, settings.peer_server_name);
             peer_network = std::make_unique<bmc::ReadOnlyServer>(settings.peer_bind, settings.peer_listen_port,
@@ -152,10 +153,10 @@ int run(const bmc::CliOptions& settings) {
             if (!peer_network->start(error)) throw std::runtime_error(error);
             peer->start();
         } catch (const std::exception& error) {
-            peer_started = false;
             if (peer_network) peer_network->stop();
             if (peer) peer->stop();
-            std::cerr << "bmc-lite: peer unavailable: " << error.what() << '\n';
+            logger.action("peer", std::string("listener unavailable: ") + error.what());
+            throw std::runtime_error(std::string("peer unavailable: ") + error.what());
         }
     }
     bmc::ReadOnlyServer network(settings.http_bind, settings.http_port, [&sel] {
@@ -213,6 +214,10 @@ int run(const bmc::CliOptions& settings) {
     unsigned completed = 0;
     bool stopping = false;
     while (!stopping && !worker_failed.load()) {
+        // 控制/心跳监听线程失效时立即退出，让 systemd Restart=on-failure 生效。
+        if (control_network && control_network->failed()) throw std::runtime_error("control listener failed");
+        if (control && control->failed()) throw std::runtime_error("control completion audit failed");
+        if (peer_network && peer_network->failed()) throw std::runtime_error("peer listener failed");
         const int ready = ::epoll_wait(poller.get(), events.data(), static_cast<int>(events.size()), 1000);
         if (ready < 0) {
             if (errno == EINTR) {
@@ -322,8 +327,7 @@ int run(const bmc::CliOptions& settings) {
     }
     logger.action("service", "stopped");
     if (!log_flushed) std::cerr << "bmc-lite: log flush failed; monitoring ran with degraded logging\n";
-    return log_flushed && network_started && control_started && peer_started && !network.failed() &&
-        (!control_network || !control_network->failed()) && (!peer_network || !peer_network->failed()) ? 0 : 1;
+    return log_flushed && network_started && !network.failed() ? 0 : 1;
 }
 }
 int main(int count, char** arguments) {

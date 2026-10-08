@@ -894,8 +894,7 @@ TEST(Sel, RefusePolicyKeepsTornTailOnDisk) {
     std::filesystem::remove(path);
 }
 TEST(Sel, SyncFailureIsCountedSeparatelyFromWriteFailure) {
-    // /dev/null 是字符设备：写入成功但 fdatasync 会返回 EINVAL。
-    // 这种情况不是数据丢失，因此必须与真正的写入失败分开计数，且不应影响 flush 的结论。
+    // /dev/null 是字符设备，不执行 fdatasync；普通文件的失败由下方注入回调验证。
     {
         bmc::SelStore store("/dev/null", 4096);
         EXPECT_NO_THROW(store.append("cpu", "normal", "sample", std::nullopt, true));
@@ -903,13 +902,19 @@ TEST(Sel, SyncFailureIsCountedSeparatelyFromWriteFailure) {
         EXPECT_EQ(store.sync_failures(), 0u);
         EXPECT_TRUE(store.flush());
     }
-    // 普通文件上两个计数都应为 0。
+    // 普通文件才会调用 fdatasync；注入 EIO 验证独立计数。
     const auto path = temporary("-sel-sync.db");
     {
-        bmc::SelStore store(path, 4096);
+        unsigned calls = 0;
+        bmc::SelStore store(path, 4096, bmc::Truncate::tail, [&](int) {
+            ++calls;
+            errno = EIO;
+            return -1;
+        });
         store.append("cpu", "normal", "sample", std::nullopt, true);
+        EXPECT_GT(calls, 0u);
         EXPECT_EQ(store.write_failures(), 0u);
-        EXPECT_EQ(store.sync_failures(), 0u);
+        EXPECT_GT(store.sync_failures(), 0u);
         EXPECT_TRUE(store.flush());
     }
     std::filesystem::remove(path);
@@ -933,7 +938,6 @@ TEST(Sel, WriteFailureDegradesInsteadOfTerminating) {
         bmc::SelStore store(target, 4096);
         // 调小上限，就能在不写 1 MiB 数据的前提下验证"超限丢弃最旧内容"。
         store.set_pending_cap(16);
-        store.set_nonblocking(true);
         for (unsigned index = 0; index < 4; ++index) {
             EXPECT_NO_THROW(store.append("cpu", "critical", "hot", 95, true));
         }
@@ -1014,6 +1018,15 @@ TEST(Logger, BoundedPendingAndFailureCounting) {
         EXPECT_EQ(logger.dropped_bytes(), 0u);
     }
     std::filesystem::remove(path);
+}
+TEST(Logger, FullDeviceDropsOldestPendingBytes) {
+    bmc::Logger logger("/dev/full", 1u << 20, 2, false, 1024);
+    const std::string filler(2048, 'x');
+    for (unsigned index = 0; index < 600; ++index)
+        logger.action("sensor", filler);
+    EXPECT_LE(logger.pending_bytes(), 1u << 20);
+    EXPECT_GT(logger.dropped_bytes(), 0u);
+    EXPECT_GT(logger.write_failures(), 0u);
 }
 TEST(Logger, WriteFailureIsCountedAndNeverThrows) {
     // 填满的管道 + O_NONBLOCK：每次 write 都以 EAGAIN 失败。日志不再逐行抛异常终止服务，
@@ -1697,19 +1710,23 @@ TEST(RateLimiter, EnforcesCapacityAndRefillsOverTime) {
     EXPECT_FALSE(limiter.allow("10.0.0.1", much_later));
 }
 
-TEST(RateLimiter, BoundsTrackedKeysAndRejectsNewOnes) {
+TEST(RateLimiter, BoundsTrackedKeysAndEvictsOldest) {
     using clock = std::chrono::steady_clock;
     const auto now = clock::time_point{} + std::chrono::seconds(1);
-    bmc::http::RateLimiter limiter(1, 1.0, 3);
+    bmc::http::RateLimiter limiter(2, 0.0, 3);
     EXPECT_TRUE(limiter.allow("a", now));
-    EXPECT_TRUE(limiter.allow("b", now));
-    EXPECT_TRUE(limiter.allow("c", now));
+    EXPECT_TRUE(limiter.allow("b", now + std::chrono::seconds(1)));
+    EXPECT_TRUE(limiter.allow("c", now + std::chrono::seconds(2)));
     EXPECT_EQ(limiter.tracked_keys(), 3u);
-    // 表已满：陌生来源被保守拒绝，而不是让表无界增长。
-    EXPECT_FALSE(limiter.allow("d", now));
+    // 表满后仍接纳新来源，并保留最近访问的来源。
+    EXPECT_TRUE(limiter.allow("d", now + std::chrono::seconds(3)));
     EXPECT_EQ(limiter.tracked_keys(), 3u);
-    // 已知键仍然可用（回填后）。
-    EXPECT_TRUE(limiter.allow("a", now + std::chrono::seconds(10)));
+    EXPECT_NEAR(limiter.tokens("a", now + std::chrono::seconds(3)), 2.0, 1e-9);
+    EXPECT_NEAR(limiter.tokens("b", now + std::chrono::seconds(3)), 1.0, 1e-9);
+    for (unsigned index = 0; index < 2000; ++index)
+        EXPECT_TRUE(limiter.allow("source-" + std::to_string(index), now + std::chrono::seconds(4 + index)));
+    EXPECT_EQ(limiter.tracked_keys(), 3u);
+    EXPECT_TRUE(limiter.allow("admin", now + std::chrono::seconds(3000)));
     limiter.clear();
     EXPECT_EQ(limiter.tracked_keys(), 0u);
     EXPECT_TRUE(limiter.allow("d", now));

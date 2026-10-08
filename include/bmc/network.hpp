@@ -23,6 +23,7 @@ public:
     bool done() const { return done_; }
     int status() const { return status_; }
     bool parsed() const { return parsed_; }
+    bool handler_failed() const { return handler_failed_; }
     std::string method() const { return parser_.request().method; }
     std::uint64_t received() const { return received_; }
     std::uint64_t sent() const { return sent_; }
@@ -36,6 +37,7 @@ private:
     std::size_t offset_ = 0;
     bool done_ = false;
     bool parsed_ = false;
+    bool handler_failed_ = false;
     int status_ = 0;
     std::uint64_t received_ = 0, sent_ = 0;
 };

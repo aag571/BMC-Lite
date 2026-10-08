@@ -267,9 +267,12 @@ RateLimiter::RateLimiter(double capacity, double refill_per_second, std::size_t 
 bool RateLimiter::allow(const std::string& key, std::chrono::steady_clock::time_point now) {
     auto found = buckets_.find(key);
     if (found == buckets_.end()) {
-        // 键数量达到上限时不再新增：宁可对陌生来源保守拒绝，也不让表无界增长。
+        // 满表时回收最久未访问的来源；仍保持内存上限，新管理员不会被永久拒绝。
         if (buckets_.size() >= max_keys_) {
-            return false;
+            auto oldest = buckets_.begin();
+            for (auto current = std::next(oldest); current != buckets_.end(); ++current)
+                if (current->second.stamp < oldest->second.stamp) oldest = current;
+            buckets_.erase(oldest);
         }
         found = buckets_.emplace(key, Bucket{capacity_, now}).first;
     }

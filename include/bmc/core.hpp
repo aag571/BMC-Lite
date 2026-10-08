@@ -176,7 +176,8 @@ enum class Truncate { refuse, tail, prepare };
 // 真正 write+fdatasync，从而把每行一次系统调用降为每批一次，同时不牺牲故障证据的持久性。
 class SelStore {
 public:
-    explicit SelStore(std::filesystem::path path, std::size_t max_records = 4096, Truncate policy = Truncate::tail);
+    explicit SelStore(std::filesystem::path path, std::size_t max_records = 4096, Truncate policy = Truncate::tail,
+                      std::function<int(int)> sync = {});
     ~SelStore();
     SelStore(const SelStore&) = delete;
     SelStore& operator=(const SelStore&) = delete;
@@ -223,6 +224,7 @@ private:
     int descriptor_ = -1;
     // 只有普通文件才尝试 fdatasync；设备节点对 fsync/fdatasync 返回 EINVAL。
     bool syncable_ = false;
+    std::function<int(int)> sync_;
     std::size_t batch_bytes_ = 4096;
     std::size_t pending_cap_ = 1u << 20;
 };

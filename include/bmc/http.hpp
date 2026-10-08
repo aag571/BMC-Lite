@@ -65,7 +65,7 @@ private:
     std::size_t header_bytes_ = 0;
 };
 
-// 令牌桶限流。键通常是 "ip:port"；逐键计数，空闲键可被 clear() 回收。
+// 令牌桶限流。控制/心跳以来源 IP 为键；键表满时回收最旧项，避免永久拒绝新地址。
 class RateLimiter {
 public:
     RateLimiter(double capacity, double refill_per_second, std::size_t max_keys = 1024);

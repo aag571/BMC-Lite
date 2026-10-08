@@ -45,9 +45,14 @@ void PeerHeartbeat::stop() noexcept {
 }
 void PeerHeartbeat::generation(std::uint64_t value) { std::lock_guard lock(mutex_); generation_ = value; }
 void PeerHeartbeat::observe(std::uint64_t value, Clock::time_point now) {
-    std::lock_guard lock(mutex_);
-    last_seen_ = now; peer_generation_ = value; ++received_;
-    if (stale_) { report_("peer recovered generation=" + std::to_string(value)); stale_ = false; }
+    bool recovered = false;
+    {
+        std::lock_guard lock(mutex_);
+        last_seen_ = now; peer_generation_ = value; ++received_;
+        recovered = stale_;
+        stale_ = false;
+    }
+    if (recovered) report_("peer recovered generation=" + std::to_string(value));
 }
 HttpResponse PeerHeartbeat::handle(const http::Request& request, const std::string& source) {
     if (!token_equal("Bearer " + token_, request.header("Authorization"))) {
@@ -70,12 +75,15 @@ void PeerHeartbeat::disconnect(Clock::time_point now) {
     next_ = now + interval_;
 }
 void PeerHeartbeat::advance(Clock::time_point now) {
+    std::optional<std::uint64_t> stale_generation;
     {
         std::lock_guard lock(mutex_);
         if (!stale_ && now - last_seen_ >= stale_after_) {
-            stale_ = true; report_("peer stale generation=" + std::to_string(peer_generation_));
+            stale_ = true;
+            stale_generation = peer_generation_;
         }
     }
+    if (stale_generation) report_("peer stale generation=" + std::to_string(*stale_generation));
     auto failed = [&] { { std::lock_guard lock(mutex_); ++failures_; } disconnect(now); };
     if (descriptor_ < 0) {
         if (now < next_) return;

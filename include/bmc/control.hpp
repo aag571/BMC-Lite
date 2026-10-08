@@ -2,6 +2,7 @@
 #include "bmc/core.hpp"
 #include "bmc/http.hpp"
 #include "bmc/service.hpp"
+#include <atomic>
 #include <map>
 #include <mutex>
 
@@ -19,11 +20,13 @@ public:
     HttpResponse handle(const http::Request& request, const std::string& peer);
     void reject(const std::string& peer, const std::string& reason);
     std::string metrics() const;
+    bool failed() const noexcept { return audit_failed_->load(); }
 private:
     std::string token_;
     Worker& worker_;
     RecoveryPolicyEngine& recovery_;
     Audit audit_;
+    std::shared_ptr<std::atomic_bool> audit_failed_ = std::make_shared<std::atomic_bool>(false);
     http::RateLimiter failures_{5, 0.2};
     mutable std::mutex mutex_;
     std::uint64_t auth_failures_ = 0, rate_limited_ = 0;

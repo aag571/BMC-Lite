@@ -34,7 +34,10 @@ void HttpConnection::read(Clock::time_point now) {
         if (result == http::ParseResult::complete) {
             parsed_ = true;
             try { response = handler_(parser_.request()); }
-            catch (const std::exception&) { response = {503, "Service Unavailable", "text/plain", "request could not be audited\n"}; }
+            catch (const std::exception&) {
+                handler_failed_ = true;
+                response = {503, "Service Unavailable", "text/plain", "request could not be audited\n"};
+            }
         }
         else if (result == http::ParseResult::too_large) response = {413, "Payload Too Large", "text/plain", "request too large\n"};
         else if (result == http::ParseResult::unsupported) response = {501, "Not Implemented", "text/plain", "unsupported request\n"};
@@ -93,11 +96,13 @@ bool ReadOnlyServer::start(std::string& error) {
     if (thread_.joinable()) { error = "already started"; return false; }
     sockaddr_in address{};
     address.sin_family = AF_INET; address.sin_port = htons(static_cast<std::uint16_t>(port_));
-    if (::inet_pton(AF_INET, bind_.c_str(), &address.sin_addr) != 1) { error = "http-bind requires an IPv4 address"; return false; }
+    if (::inet_pton(AF_INET, bind_.c_str(), &address.sin_addr) != 1) {
+        error = (handler_ ? role_ : "http") + "-bind requires an IPv4 address"; return false;
+    }
     if (handler_) {
         if (certificate_.empty() != key_.empty()) { error = "TLS requires both certificate and key"; return false; }
         if ((ntohl(address.sin_addr.s_addr) >> 24) != 127 && certificate_.empty()) {
-            error = "non-loopback control requires TLS"; return false;
+            error = "non-loopback " + role_ + " requires TLS"; return false;
         }
         if (!certificate_.empty()) {
             try { tls_ = std::make_unique<TlsContext>(certificate_, key_); }
@@ -208,6 +213,8 @@ void ReadOnlyServer::loop() noexcept {
                 if (connection.writing()) {
                     connection.write();
                 }
+                // 认证端点无法完成审计时停止监听；主线程会检测 failed_ 并以非零码退出。
+                if (handler_ && connection.handler_failed()) throw std::runtime_error(role_ + " handler failed");
                 epoll_event registration{};
                 registration.events = state.tls && state.tls->events() ? state.tls->events() : (connection.writing() ? EPOLLOUT : EPOLLIN);
                 registration.data.fd = descriptor;

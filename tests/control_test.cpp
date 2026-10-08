@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 #include <atomic>
 #include <fstream>
+#include <mutex>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -41,6 +42,15 @@ TEST(Control, NonLoopbackPlainListenerFailsBeforeSocketCreation) {
     std::string error;
     EXPECT_FALSE(server.start(error));
     EXPECT_NE(error.find("requires TLS"), std::string::npos);
+}
+TEST(Peer, NonLoopbackPlainListenerFailsBeforeSocketCreation) {
+    bmc::ReadOnlyServer server("0.0.0.0", 9443,
+        [](const auto&, const auto&) { return bmc::HttpResponse{}; },
+        {}, "", "");
+    server.role("peer");
+    std::string error;
+    EXPECT_FALSE(server.start(error));
+    EXPECT_NE(error.find("non-loopback peer requires TLS"), std::string::npos);
 }
 TEST(Control, CliDocumentsAndParsesControlOptions) {
     const auto options = bmc::parse_options({"--control-port", "8443", "--control-token-file", "/token",
@@ -98,4 +108,48 @@ TEST(Control, WorkerUsesConfiguredPathAndRecoveryCooldown) {
     EXPECT_EQ(service.handle(request, "127.0.0.1").status, 202);
     worker.stop();
     EXPECT_EQ(writes.load(), 1u);
+}
+TEST(Control, AuditFailureCannotExecuteQueuedAction) {
+    bmc::Worker worker(8, 1);
+    std::atomic<unsigned> writes{0};
+    bmc::RecoveryPolicyEngine recovery([&](const bmc::RecoveryRequest&) {
+        ++writes;
+        return true;
+    });
+    std::mutex audit_mutex;
+    std::vector<std::string> records;
+    bmc::ControlService service(std::string(40, 'x'), worker, recovery, [&](const auto& record) {
+        std::lock_guard lock(audit_mutex);
+        records.push_back(record);
+        if (record.find("outcome=accepted") != std::string::npos)
+            throw std::runtime_error("audit unavailable");
+    });
+    service.configure(1, {{"cpu", "/configured/pwm"}});
+    bmc::http::Request request;
+    request.method = "POST"; request.target = "/v1/actions/fan";
+    request.headers.emplace_back("Authorization", "Bearer " + std::string(40, 'x'));
+    request.body = "{\"sensor\":\"cpu\",\"action\":\"increase_fan\"}";
+    EXPECT_THROW(service.handle(request, "127.0.0.1"), std::runtime_error);
+    worker.stop();
+    EXPECT_EQ(writes.load(), 0u);
+    ASSERT_EQ(records.size(), 2u);
+    EXPECT_NE(records[0].find("outcome=requested"), std::string::npos);
+    EXPECT_NE(records[1].find("outcome=accepted"), std::string::npos);
+}
+TEST(Control, CompletionAuditFailureIsVisibleToDaemon) {
+    bmc::Worker worker(8, 1);
+    bmc::RecoveryPolicyEngine recovery([](const bmc::RecoveryRequest&) { return true; });
+    bmc::ControlService service(std::string(40, 'x'), worker, recovery, [](const auto& record) {
+        if (record.find("detail=") != std::string::npos)
+            throw std::runtime_error("completion audit unavailable");
+    });
+    service.configure(1, {{"cpu", "/configured/pwm"}});
+    bmc::http::Request request;
+    request.method = "POST"; request.target = "/v1/actions/fan";
+    request.headers.emplace_back("Authorization", "Bearer " + std::string(40, 'x'));
+    request.body = "{\"sensor\":\"cpu\",\"action\":\"increase_fan\"}";
+    EXPECT_EQ(service.handle(request, "127.0.0.1").status, 202);
+    worker.stop();
+    EXPECT_TRUE(service.failed());
+    EXPECT_EQ(worker.stats().failed, 1u);
 }

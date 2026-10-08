@@ -1,8 +1,9 @@
 # Control service installation and usage
 
 Control is disabled by default. A port and valid token file are both required. Invalid credentials,
-certificates or binding keep the control listener closed while monitoring continues; the daemon
-reports the reason and returns status 1 when it exits. Read-only and control use separate ports.
+certificates or binding make the daemon exit immediately with a nonzero status. A failed control
+listener or audit at runtime also exits nonzero so systemd can restart it. Read-only HTTP uses a
+separate port and its bind failure still allows monitoring to continue.
 
 ## Source installation on Ubuntu 24.04
 
@@ -49,7 +50,7 @@ For manual execution, set ownership to the account running the binary. Never pas
 
 Copy cert.pem to the client as a trust anchor. Keep the private key on the server. In managed
 networks use an internal CA certificate. Clients verify both chain and hostname/IP with --cacert;
-do not use curl -k. Control uses server TLS plus Bearer authentication. The separate peer service includes a verified outbound TLS
+do not use curl -k. This is server TLS plus Bearer authentication, not mTLS or an outbound TLS
 client. Restart after certificate/token rotation.
 
 ## Enable systemd
@@ -100,7 +101,9 @@ default. Real PWM needs --enable-actions and device permissions; it writes 255 t
 
 Responses: 200 query success; 202 queued; 400 invalid request; 401 bad credentials; 429 rate limit;
 503 queue full or unavailable audit persistence. SEL stores action/sensor/outcome/peer/request_id.
-Outcomes include accepted/rejected/unauthorized/rate-limited. Correlate validation and execution
+Outcomes include requested/accepted/rejected/unauthorized/rate-limited. A valid action is audited
+as requested before queueing and as accepted only after successful queueing. No action runs until
+the accepted audit is durable. Correlate validation and execution
 by request_id; detail can be completed, cooldown or failed. Accepted validation can be followed by
 queue rejection or action failure.
 

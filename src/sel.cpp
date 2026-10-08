@@ -81,8 +81,9 @@ void SelStore::write_probe(const std::filesystem::path& path) {
     }
 }
 
-SelStore::SelStore(std::filesystem::path path, std::size_t max_records, Truncate policy)
-    : path_(std::move(path)), max_records_(max_records), policy_(policy) {
+SelStore::SelStore(std::filesystem::path path, std::size_t max_records, Truncate policy, std::function<int(int)> sync)
+    : path_(std::move(path)), max_records_(max_records), policy_(policy), sync_(std::move(sync)) {
+    if (!sync_) sync_ = [](int descriptor) { return ::fdatasync(descriptor); };
     if (max_records_ == 0) {
         throw std::invalid_argument("zero SEL capacity");
     }
@@ -109,7 +110,7 @@ void SelStore::open() {
     // 避免在只允许打开既有设备的路径上拿到 EACCES。
     std::error_code status;
     const bool exists = std::filesystem::exists(path_, status);
-    const int flags = O_RDWR | O_APPEND | O_CLOEXEC | (exists ? 0 : O_CREAT);
+    const int flags = O_RDWR | O_APPEND | O_CLOEXEC | O_NONBLOCK | (exists ? 0 : O_CREAT);
     descriptor_ = ::open(path_.c_str(), flags, 0644);
     if (descriptor_ < 0) {
         throw std::system_error(errno, std::generic_category(), "open sel");
@@ -198,7 +199,7 @@ void SelStore::trim() {
         if (output < 0) {
             throw std::system_error(errno, std::generic_category(), "open sel compaction");
         }
-        if (::fcntl(output, F_SETFD, FD_CLOEXEC) < 0 || ::fcntl(output, F_SETFL, O_APPEND) < 0 || ::fchmod(output, 0644) < 0)
+        if (::fcntl(output, F_SETFD, FD_CLOEXEC) < 0 || ::fcntl(output, F_SETFL, O_APPEND | O_NONBLOCK) < 0 || ::fchmod(output, 0644) < 0)
             throw std::system_error(errno, std::generic_category(), "configure sel compaction");
         for (const auto& record : records_) {
             write_all(output, encode(record));
@@ -239,7 +240,7 @@ bool SelStore::drain(bool sync) {
         // 短写后只保留尚未写出的后缀，重试不能把已写出的半条记录再写一次。
         pending_.erase(0, static_cast<std::size_t>(written));
     }
-    if (sync && syncable_ && ::fdatasync(descriptor_) < 0) {
+    if (sync && syncable_ && sync_(descriptor_) < 0) {
         // 同步失败不等于数据丢失（可能只是该文件系统不支持），因此单独计数。
         ++sync_failures_;
     }

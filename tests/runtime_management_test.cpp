@@ -70,6 +70,29 @@ TEST(RuntimeManagement, DroppedBytesAloneTriggerOneBusNotification) {
     EXPECT_NE(sel.query()[0].message.find("dropped-bytes=10"), std::string::npos);
     std::filesystem::remove(path);
 }
+TEST(RuntimeManagement, SelWriteFailureReportsOnce) {
+    bmc::SelStore sel("/dev/full");
+    sel.append("cpu", "critical", "failure", std::nullopt, true);
+    ASSERT_GT(sel.write_failures(), 0u);
+    bmc::EventBus bus;
+    bmc::Monitor monitor;
+    HealthLogger logger;
+    unsigned received = 0;
+    bus.subscribe(bmc::BusEventType::service, [&](const bmc::BusEvent& event) {
+        if (event.source == "sel") ++received;
+    });
+    std::vector<bmc::MonitorSensor> sensors;
+    bmc::Worker worker(4, 1);
+    bmc::FaultRuleEngine rules({});
+    bmc::RecoveryPolicyEngine recovery([](const bmc::RecoveryRequest&) { return true; });
+    std::atomic_bool failed{false};
+    monitor.poll(sensors, logger, worker, bus, rules, recovery, sel, failed);
+    monitor.poll(sensors, logger, worker, bus, rules, recovery, sel, failed);
+    worker.stop();
+    bus.stop();
+    EXPECT_EQ(received, 1u);
+    EXPECT_EQ(logger.writes, 1u);
+}
 TEST(RuntimeManagement, DisappearingSensorsDoNotAccumulateRuleStates) {
     bmc::FaultRuleEngine rules({{"fault", "*", bmc::State::critical, 2, 2, "inspect_device"}});
     for (unsigned index = 0; index < 10000; ++index) {

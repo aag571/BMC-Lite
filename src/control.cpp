@@ -4,6 +4,7 @@
 #include <array>
 #include <cctype>
 #include <fcntl.h>
+#include <future>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -126,33 +127,48 @@ HttpResponse ControlService::handle(const http::Request& request, const std::str
     try {
         if (request.method != "POST") throw std::invalid_argument("POST required");
         const auto fields = action_fields(request.body);
-        sensor = fields.at("sensor"); action = fields.at("action");
+        const auto sensor_field = fields.find("sensor");
+        const auto action_field = fields.find("action");
+        if (sensor_field == fields.end() || action_field == fields.end())
+            throw std::invalid_argument("missing action field");
+        sensor = sensor_field->second; action = action_field->second;
         const bool fan = request.target == "/v1/actions/fan" && action == "increase_fan";
         const bool inspect = request.target == "/v1/actions/inspect" && action == "inspect_device";
         const auto config = paths_.find(sensor);
         if ((!fan && !inspect) || config == paths_.end() || (fan && config->second.empty()))
             throw std::invalid_argument("unknown sensor or unsupported action");
-        const RecoveryRequest task{"control", sensor, action, id, config->second};
-        // 先确保请求审计写入成功，再允许任务进入线程池。
-        audit("accepted");
-        const auto completion = audit_;
-        auto* recovery = &recovery_;
-        if (!worker_.submit([task, completion, recovery, peer] {
+    } catch (const std::invalid_argument&) {
+        audit("rejected");
+        return response(400, "Bad Request", "invalid control request");
+    }
+    // 先持久化请求，再排队；闸门保证 accepted 审计完成前绝不执行硬件动作。
+    audit("requested");
+    const RecoveryRequest task{"control", sensor, action, id, paths_.at(sensor)};
+    auto gate = std::make_shared<std::promise<bool>>();
+    const auto ready = gate->get_future().share();
+    const auto completion = audit_;
+    const auto audit_failed = audit_failed_;
+    auto* recovery = &recovery_;
+    bool queued = false;
+    try {
+        queued = worker_.submit([task, completion, recovery, peer, ready, audit_failed] {
+            if (!ready.get()) return;
             const auto result = recovery->submit(task);
             std::ostringstream record;
             record << "action=" << std::quoted(task.action) << " sensor=" << std::quoted(task.sensor)
                    << " outcome=" << (result && result->success ? "accepted" : "rejected")
                    << " peer=" << std::quoted(peer) << " request_id=" << task.sequence
                    << " detail=" << std::quoted(result ? result->detail : "no result");
-            completion(record.str());
-        }, 10)) {
-            audit("rejected");
-            return response(503, "Service Unavailable", "recovery queue full");
-        }
-        return response(202, "Accepted", "queued");
-    } catch (const std::invalid_argument&) {
-        audit("rejected");
-        return response(400, "Bad Request", "invalid control request");
+            try { completion(record.str()); }
+            catch (...) { audit_failed->store(true); throw; }
+        }, 10);
+        audit(queued ? "accepted" : "rejected");
+        gate->set_value(queued);
+    } catch (...) {
+        gate->set_value(false);
+        throw;
     }
+    return queued ? response(202, "Accepted", "queued")
+                  : response(503, "Service Unavailable", "recovery queue full");
 }
 }
