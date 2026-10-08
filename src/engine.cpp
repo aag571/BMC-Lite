@@ -1,25 +1,9 @@
 #include "bmc/core.hpp"
 #include <algorithm>
-#include <cerrno>
 #include <cmath>
-#include <fcntl.h>
-#include <iomanip>
-#include <linux/i2c-dev.h>
-#include <linux/i2c.h>
-#include <linux/gpio.h>
-#include <cstring>
-#include <set>
-#include <sstream>
-#include <stdexcept>
-#include <system_error>
-#include <sys/ioctl.h>
-#include <unistd.h>
 #include <utility>
-#include <ctime>
 
 namespace bmc {
-namespace {
-}
 Engine::Engine(Config config) : config_(std::move(config)) { validate(config_); }
 // 迟滞只影响恢复阈值，去抖则要求候选状态连续出现；两者解决不同类型的抖动。
 State Engine::state() const { return state_; }

@@ -1,16 +1,17 @@
 #include "bmc/monitor.hpp"
 #include <iostream>
+#include <stdexcept>
+#include <string>
+#include <system_error>
 
 namespace bmc {
-std::vector<MonitorSensor> prepare_sensors(const std::string& path) {
+std::vector<MonitorSensor> prepare_sensors(const std::string& path, LinuxIo& io) {
     std::vector<MonitorSensor> result;
     const auto configs = bmc::load_config(path);
     result.reserve(configs.size());
     for (const auto& config : configs) {
-        if (config.backend == "mock") {
-            auto validation_reader = bmc::make_reader(config);
-        }
-        result.emplace_back(config);
+        // mock 序列的合法性由 make_device 内部构造 reader 时校验，这里不再预构造一个被丢弃的读取器。
+        result.emplace_back(config, io);
     }
     return result;
 }

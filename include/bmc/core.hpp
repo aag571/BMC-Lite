@@ -1,4 +1,5 @@
 #pragma once
+#include "bmc/linux_io.hpp"
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -196,8 +197,8 @@ public:
     virtual ~Reader() = default;
     virtual std::optional<double> read() = 0;
 };
-std::unique_ptr<Reader> make_reader(const Config& config);
-std::unique_ptr<Device> make_device(const Config& config);
+std::unique_ptr<Reader> make_reader(const Config& config, LinuxIo& io);
+std::unique_ptr<Device> make_device(const Config& config, LinuxIo& io);
 // 监控逻辑依赖日志接口；测试可实现 RecordingLogger，而不需要创建真实文件。
 class EventLogger {
 public:
@@ -241,5 +242,5 @@ private:
     bool stopping_ = false;
     std::vector<std::thread> threads_;
 };
-void write_pwm(const std::string& path, unsigned value);
+void write_pwm(const std::string& path, unsigned value, LinuxIo& io = system_io());
 }

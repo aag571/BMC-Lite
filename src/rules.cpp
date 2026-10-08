@@ -1,25 +1,11 @@
 #include "bmc/core.hpp"
-#include <algorithm>
-#include <cerrno>
-#include <cmath>
-#include <fcntl.h>
-#include <iomanip>
-#include <linux/i2c-dev.h>
-#include <linux/i2c.h>
-#include <linux/gpio.h>
-#include <cstring>
 #include <set>
 #include <sstream>
 #include <stdexcept>
-#include <system_error>
-#include <sys/ioctl.h>
-#include <unistd.h>
 #include <utility>
-#include <ctime>
+#include <vector>
 
 namespace bmc {
-namespace {
-}
 std::vector<FaultRule> load_rules(const std::filesystem::path& path) {
     std::ifstream input(path);
     if (!input) throw std::runtime_error("cannot open rules: " + path.string());

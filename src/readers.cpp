@@ -1,21 +1,16 @@
 #include "bmc/core.hpp"
 #include <algorithm>
-#include <cerrno>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <fcntl.h>
-#include <iomanip>
+#include <linux/gpio.h>
 #include <linux/i2c-dev.h>
 #include <linux/i2c.h>
-#include <linux/gpio.h>
-#include <cstring>
-#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
-#include <sys/ioctl.h>
 #include <unistd.h>
-#include <utility>
-#include <ctime>
 
 namespace bmc {
 namespace {
@@ -38,6 +33,10 @@ std::vector<std::string> split(const std::string& text, char separator) {
         result.push_back(token);
     }
     return result;
+}
+// ioctl 的第三个参数在 I2C_SLAVE 是整数、在其余调用是结构体指针，统一经 void* 传递。
+void* as_ioctl_argument(unsigned long value) {
+    return reinterpret_cast<void*>(static_cast<std::uintptr_t>(value));
 }
 }
 namespace {
@@ -84,7 +83,7 @@ private:
 };
 class I2cReader final : public Reader {
 public:
-    explicit I2cReader(const Config& config) : scale_(config.scale) {
+    explicit I2cReader(const Config& config, LinuxIo& io) : io_(io), scale_(config.scale) {
         const auto parts = split(config.path, ',');
         if (parts.size() != 3) {
             throw std::invalid_argument("i2c path requires device,address,register");
@@ -96,16 +95,16 @@ public:
         if (address_end != parts[1].size() || register_end != parts[2].size() || address > 0x7f || register_value > 0xff) {
             throw std::invalid_argument("invalid i2c address or register");
         }
-        register_ = static_cast<__u8>(register_value);
-        device_ = Fd(::open(parts[0].c_str(), O_RDWR | O_CLOEXEC));
+        register_ = static_cast<std::uint8_t>(register_value);
+        device_ = Fd(io_.open(parts[0], O_RDWR | O_CLOEXEC));
         if (device_.get() < 0) {
             system_failure("open i2c device");
         }
-        if (::ioctl(device_.get(), I2C_SLAVE, address) < 0) {
+        if (io_.ioctl(device_.get(), I2C_SLAVE, as_ioctl_argument(address)) < 0) {
             system_failure("select i2c slave");
         }
         unsigned long functions = 0;
-        if (::ioctl(device_.get(), I2C_FUNCS, &functions) < 0) {
+        if (io_.ioctl(device_.get(), I2C_FUNCS, &functions) < 0) {
             system_failure("query i2c capabilities");
         }
         if ((functions & I2C_FUNC_SMBUS_READ_WORD_DATA) == 0) {
@@ -119,20 +118,21 @@ public:
         request.command = register_;
         request.size = I2C_SMBUS_WORD_DATA;
         request.data = &data;
-        if (::ioctl(device_.get(), I2C_SMBUS, &request) < 0) {
+        if (io_.ioctl(device_.get(), I2C_SMBUS, &request) < 0) {
             return std::nullopt;
         }
         const double value = static_cast<double>(data.word) * scale_;
         return std::isfinite(value) ? std::optional<double>(value) : std::nullopt;
     }
 private:
+    LinuxIo& io_;
     Fd device_;
-    __u8 register_ = 0;
+    std::uint8_t register_ = 0;
     double scale_;
 };
 class GpioReader final : public Reader {
 public:
-    explicit GpioReader(const Config& config) : scale_(config.scale) {
+    explicit GpioReader(const Config& config, LinuxIo& io) : io_(io), scale_(config.scale) {
         const auto parts = split(config.path, ',');
         if (parts.size() < 2 || parts.size() > 3 || parts[0].empty()) {
             throw std::invalid_argument("gpio path requires chip,offset[,active-low]");
@@ -146,10 +146,10 @@ public:
         if (offset > UINT32_MAX || (parts.size() == 3 && parts[2] != "active-low")) {
             throw std::invalid_argument("invalid GPIO options");
         }
-        Fd chip(::open(parts[0].c_str(), O_RDONLY | O_CLOEXEC));
+        Fd chip(io_.open(parts[0], O_RDONLY | O_CLOEXEC));
         if (chip.get() < 0) system_failure("open GPIO chip");
         gpiochip_info info {};
-        if (::ioctl(chip.get(), GPIO_GET_CHIPINFO_IOCTL, &info) < 0) system_failure("query GPIO chip");
+        if (io_.ioctl(chip.get(), GPIO_GET_CHIPINFO_IOCTL, &info) < 0) system_failure("query GPIO chip");
         if (offset >= info.lines) throw std::invalid_argument("GPIO offset outside chip");
         gpio_v2_line_request request {};
         request.offsets[0] = static_cast<__u32>(offset);
@@ -157,24 +157,27 @@ public:
         request.config.flags = GPIO_V2_LINE_FLAG_INPUT;
         if (parts.size() == 3) request.config.flags |= GPIO_V2_LINE_FLAG_ACTIVE_LOW;
         std::strncpy(request.consumer, "bmc-lite", sizeof(request.consumer) - 1);
-        if (::ioctl(chip.get(), GPIO_V2_GET_LINE_IOCTL, &request) < 0) system_failure("request GPIO v2 input");
+        if (io_.ioctl(chip.get(), GPIO_V2_GET_LINE_IOCTL, &request) < 0) system_failure("request GPIO v2 input");
         line_ = Fd(request.fd);
+        // 注意：GPIO_V2_GET_LINE_IOCTL 返回的描述符由内核分配，FakeLinuxIo 无法提供真实 fd，
+        // 因此这一句仍是真实系统调用；GPIO 的完整生命周期（含 line fd）需要实机或 QEMU 验证。
         if (::fcntl(line_.get(), F_SETFD, FD_CLOEXEC) < 0) system_failure("set GPIO close-on-exec");
     }
     std::optional<double> read() override {
         gpio_v2_line_values values {};
         values.mask = 1;
-        if (::ioctl(line_.get(), GPIO_V2_LINE_GET_VALUES_IOCTL, &values) < 0) return std::nullopt;
+        if (io_.ioctl(line_.get(), GPIO_V2_LINE_GET_VALUES_IOCTL, &values) < 0) return std::nullopt;
         return (values.bits & 1) ? scale_ : 0.0;
     }
 private:
+    LinuxIo& io_;
     Fd line_;
     double scale_;
 };
 class AdapterDevice final : public Device {
 public:
-    explicit AdapterDevice(const Config& config)
-        : config_(config), info_{config.id, config.backend, config.path, "BMC sensor adapter", true, !config.action_path.empty()} {}
+    AdapterDevice(const Config& config, LinuxIo& io)
+        : io_(io), config_(config), info_{config.id, config.backend, config.path, "BMC sensor adapter", true, !config.action_path.empty()} {}
     const DeviceInfo& info() const override { return info_; }
     DeviceState state() const override { return state_; }
     bool open() override {
@@ -184,7 +187,7 @@ public:
             return false;
         }
         try {
-            reader_ = make_reader(config_);
+            reader_ = make_reader(config_, io_);
         } catch (const std::exception&) {
             state_ = DeviceState::failed;
             return false;
@@ -209,7 +212,8 @@ public:
     bool write_value(double value) override {
         if (!info_.writable || !std::isfinite(value) || value < 0 || value > 255 || std::floor(value) != value) return false;
         try {
-            write_pwm(config_.action_path, static_cast<unsigned>(value));
+            // 设备写走注入的 io，与 PwmAction 的路径保持同一实现。
+            write_pwm(config_.action_path, static_cast<unsigned>(value), io_);
             return true;
         } catch (const std::exception&) {
             state_ = DeviceState::degraded;
@@ -217,16 +221,17 @@ public:
         }
     }
 private:
+    LinuxIo& io_;
     Config config_;
     DeviceInfo info_;
     DeviceState state_ = DeviceState::closed;
     std::unique_ptr<Reader> reader_;
 };
 }
-std::unique_ptr<Reader> make_reader(const Config& config) {
+std::unique_ptr<Reader> make_reader(const Config& config, LinuxIo& io) {
     validate(config);
     if (config.backend == "gpio") {
-        return std::make_unique<GpioReader>(config);
+        return std::make_unique<GpioReader>(config, io);
     }
     if (config.backend == "mock") {
         return std::make_unique<MockReader>(config);
@@ -234,11 +239,11 @@ std::unique_ptr<Reader> make_reader(const Config& config) {
     if (config.backend == "sysfs") {
         return std::make_unique<SysfsReader>(config);
     }
-    return std::make_unique<I2cReader>(config);
+    return std::make_unique<I2cReader>(config, io);
 }
-std::unique_ptr<Device> make_device(const Config& config) {
+std::unique_ptr<Device> make_device(const Config& config, LinuxIo& io) {
     validate(config);
-    return std::make_unique<AdapterDevice>(config);
+    return std::make_unique<AdapterDevice>(config, io);
 }
 void DeviceRegistry::add(std::unique_ptr<Device> device) {
     if (!device || device->info().id.empty() || find(device->info().id) != nullptr) {

@@ -54,7 +54,7 @@ The first test build downloads GoogleTest 1.15.2. An offline production build ca
 | `tests/runtime_test.py` | Python | Process startup, SIGHUP reload, invalid configuration, SIGTERM |
 | `tests/fault_injection_test.py` | Python | Daemon behavior with missing inputs and failed writes |
 | `tests/metrics_test.py` | Python | Python management-tool formatting |
-| `tests/linux_io_fake_test.py` | Python | Basic OS file-descriptor checks; **not** an injected I2C/GPIO mock |
+| `tests/linux_io_fake_test.py` | Python | Basic OS file-descriptor checks; unrelated to the C++ `FakeLinuxIo` |
 
 Run C++ tests independently:
 
@@ -64,7 +64,7 @@ Run C++ tests independently:
 ./build/bmc_stress
 ```
 
-There is currently no injectable LinuxIo/FakeLinuxIo implementation. The misleading test filename does not establish mocked ioctl coverage.
+`LinuxIo` (`include/bmc/linux_io.hpp`) is the single injection point for system calls. `PosixLinuxIo` forwards to the real `open`/`ioctl`/`read`/`write`/`close`, and the `FakeLinuxIo` defined in `tests/core_test.cpp` scripts ioctl replies and captures writes, so the I2C decode path and the PWM write path are covered without `/dev/i2c-*` or `/dev/gpiochip*`. Coverage stops short of the GPIO line descriptor: `GPIO_V2_GET_LINE_IOCTL` returns a kernel-assigned fd that a fake cannot provide, so GPIO tests assert request construction (offsets, flags, the `fcntl` failure) rather than a live line. `tests/linux_io_fake_test.py` is unrelated to `FakeLinuxIo` despite the similar name.
 
 ## 4. First foreground run
 

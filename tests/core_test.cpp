@@ -1,10 +1,20 @@
 #include "bmc/core.hpp"
+#include "bmc/action.hpp"
 #include <atomic>
+#include <cerrno>
+#include <cstdint>
+#include <cstring>
 #include <gtest/gtest.h>
 #include <limits>
+#include <linux/gpio.h>
+#include <linux/i2c-dev.h>
+#include <linux/i2c.h>
 #include <future>
+#include <map>
 #include <mutex>
+#include <string>
 #include <unistd.h>
+#include <vector>
 
 namespace {
 bmc::Config policy() {
@@ -17,6 +27,91 @@ bmc::Config policy() {
 std::filesystem::path temporary(const std::string& suffix) {
     return std::filesystem::temp_directory_path() / ("bmc-test-" + std::to_string(::getpid()) + suffix);
 }
+// 脚本化的 LinuxIo：让 I2C / GPIO / PWM 路径不需要真实 /dev/i2c-* 与 /dev/gpiochip* 就能被单元测试覆盖。
+class FakeLinuxIo final : public bmc::LinuxIo {
+public:
+    struct Descriptor {
+        std::map<unsigned long, std::vector<std::uint8_t>> replies;
+        std::vector<std::string> writes;
+        bool short_write = false;
+    };
+    int open(const std::string& path, int) override {
+        opened.push_back(path);
+        if (path == "/dev/fake-open-failure") {
+            errno = ENOENT;
+            return -1;
+        }
+        const auto existing = path_descriptors.find(path);
+        if (existing != path_descriptors.end()) {
+            return existing->second;
+        }
+        const int descriptor = next_descriptor++;
+        path_descriptors[path] = descriptor;
+        descriptors[descriptor];
+        return descriptor;
+    }
+    int ioctl(int descriptor, unsigned long request, void* argument) override {
+        ++ioctls;
+        const auto found = descriptors.find(descriptor);
+        if (found == descriptors.end()) {
+            errno = ENODEV;
+            return -1;
+        }
+        auto& entry = found->second;
+        const auto reply = entry.replies.find(request);
+        if (reply == entry.replies.end()) {
+            errno = ENOTTY;
+            return -1;
+        }
+        // 回填假数据，模拟内核对调用方传入结构体的写入。未显式回填的请求
+        // （I2C_SLAVE、GPIO_V2_GET_LINE_IOCTL）属于"纯成功"型 ioctl：在 replies 里登记即表示成功。
+        if (request == I2C_SLAVE) {
+            ++selected_slaves;
+        } else if (request == I2C_FUNCS) {
+            *static_cast<unsigned long*>(argument) = i2c_functions;
+        } else if (request == I2C_SMBUS) {
+            auto* transaction = static_cast<i2c_smbus_ioctl_data*>(argument);
+            auto* data = static_cast<i2c_smbus_data*>(transaction->data);
+            std::memcpy(&data->word, reply->second.data(), sizeof(data->word));
+        } else if (request == GPIO_GET_CHIPINFO_IOCTL) {
+            static_cast<gpiochip_info*>(argument)->lines = gpio_lines;
+        } else if (request == GPIO_V2_GET_LINE_IOCTL) {
+            auto* line_request = static_cast<gpio_v2_line_request*>(argument);
+            line_requests.push_back(line_request->config.flags);
+            // 内核分配的 line 描述符无法伪造：置为 -1，让 reader 里随后的 ::fcntl 以 EBADF 失败。
+            // 因此 GPIO 的覆盖范围止于"请求参数构造"，line fd 的生命周期仍需实机或 QEMU 验证。
+            line_request->fd = -1;
+        } else if (request == GPIO_V2_LINE_GET_VALUES_IOCTL) {
+            static_cast<gpio_v2_line_values*>(argument)->bits = reply->second.at(0);
+        }
+        return 0;
+    }
+    ssize_t read(int, void*, std::size_t) override {
+        errno = EIO;
+        return -1;
+    }
+    ssize_t write(int descriptor, const void* buffer, std::size_t count) override {
+        const auto found = descriptors.find(descriptor);
+        if (found == descriptors.end()) {
+            errno = EBADF;
+            return -1;
+        }
+        found->second.writes.emplace_back(static_cast<const char*>(buffer), count);
+        if (found->second.short_write) {
+            return static_cast<ssize_t>(count) - 1;
+        }
+        return static_cast<ssize_t>(count);
+    }
+    unsigned long i2c_functions = I2C_FUNC_SMBUS_READ_WORD_DATA;
+    std::uint32_t gpio_lines = 32;
+    std::map<std::string, int> path_descriptors;
+    std::map<int, Descriptor> descriptors;
+    std::vector<std::uint64_t> line_requests;
+    std::vector<std::string> opened;
+    int ioctls = 0;
+    int selected_slaves = 0;
+    int next_descriptor = 101;
+};
 TEST(Engine, DebouncesCriticalAndUsesInclusiveBoundary) {
     bmc::Engine engine(policy());
     EXPECT_FALSE(engine.update(90));
@@ -101,7 +196,7 @@ TEST(Config, RejectsBrokenThresholdsAndWindows) {
 TEST(Reader, MockCyclesAndScales) {
     auto config = policy();
     config.scale = 2;
-    auto reader = bmc::make_reader(config);
+    auto reader = bmc::make_reader(config, bmc::system_io());
     EXPECT_EQ(reader->read(), 80);
     EXPECT_EQ(reader->read(), 150);
     EXPECT_EQ(reader->read(), 190);
@@ -114,7 +209,7 @@ TEST(Reader, SysfsRejectsMalformedAndMissingData) {
     config.backend = "sysfs";
     config.path = path.string();
     config.scale = 0.001;
-    auto reader = bmc::make_reader(config);
+    auto reader = bmc::make_reader(config, bmc::system_io());
     EXPECT_FALSE(reader->read());
     { std::ofstream output(path); output << "72000\n"; }
     EXPECT_EQ(reader->read(), 72);
@@ -156,17 +251,94 @@ TEST(Config, RejectsDuplicateAndNegativeWindow) {
 TEST(Pwm, ValidatesAndWritesConfiguredFile) {
     const auto path = temporary("-pwm");
     { std::ofstream output(path); output << "0\n"; }
-    EXPECT_THROW(bmc::write_pwm(path.string(), 256), std::invalid_argument);
-    bmc::write_pwm(path.string(), 255);
+    EXPECT_THROW(bmc::write_pwm(path.string(), 256, bmc::system_io()), std::invalid_argument);
+    bmc::write_pwm(path.string(), 255, bmc::system_io());
     std::ifstream input(path);
     unsigned value = 0;
     input >> value;
     EXPECT_EQ(value, 255u);
     std::filesystem::remove(path);
 }
+// 以下用例验证"注入后的调用链"，而不是真实硬件行为。
+std::uint16_t decode_i2c_word(const std::vector<std::uint8_t>& bytes) {
+    std::uint16_t word = 0;
+    std::memcpy(&word, bytes.data(), sizeof(word));
+    return word;
+}
+unsigned long read_i2c_functions(FakeLinuxIo& fake) {
+    unsigned long value = 0;
+    const auto& bytes = fake.descriptors[fake.path_descriptors["/dev/fake-i2c"]].replies.at(I2C_FUNCS);
+    std::memcpy(&value, bytes.data(), sizeof(value));
+    return value;
+}
+TEST(FakeIo, RequiresARealShortWriteToBeDetectable) {
+    FakeLinuxIo fake;
+    bmc::write_pwm("/dev/fake-pwm", 200, fake);
+    auto& entry = fake.descriptors[fake.path_descriptors["/dev/fake-pwm"]];
+    ASSERT_EQ(entry.writes.size(), 1u);
+    EXPECT_EQ(entry.writes[0], "200\n");
+    entry.short_write = true;
+    EXPECT_THROW(bmc::write_pwm("/dev/fake-pwm", 201, fake), std::runtime_error);
+}
+TEST(FakeIo, PwmActionWritesThroughInjectedIo) {
+    FakeLinuxIo fake;
+    bmc::PwmAction action(fake);
+    EXPECT_TRUE(action.execute({"rule", "cpu", "inspect_device", 1, ""}));
+    EXPECT_TRUE(action.execute({"rule", "cpu", "increase_fan", 2, "/dev/fake-pwm"}));
+    ASSERT_EQ(fake.descriptors[fake.path_descriptors["/dev/fake-pwm"]].writes.size(), 1u);
+    EXPECT_EQ(fake.descriptors[fake.path_descriptors["/dev/fake-pwm"]].writes[0], "255\n");
+    EXPECT_FALSE(action.execute({"rule", "cpu", "increase_fan", 3, ""}));
+    EXPECT_FALSE(action.execute({"rule", "cpu", "power_cycle", 4, "/dev/fake-pwm"}));
+}
+TEST(FakeIo, I2cReaderPropagatesOpenAndCapabilityFailures) {
+    FakeLinuxIo fake;
+    auto config = policy();
+    config.backend = "i2c";
+    config.path = "/dev/fake-open-failure,0x48,0x00";
+    EXPECT_THROW(bmc::make_reader(config, fake), std::system_error);
+    FakeLinuxIo incapable;
+    incapable.descriptors[101].replies[I2C_SLAVE] = {0};
+    incapable.descriptors[101].replies[I2C_FUNCS] = {0, 0, 0, 0, 0, 0, 0, 0};
+    config.path = "/dev/fake-i2c,0x48,0x00";
+    EXPECT_THROW(bmc::make_reader(config, incapable), std::runtime_error);
+}
+TEST(FakeIo, I2cReaderDecodesWordAndScalesIt) {
+    FakeLinuxIo fake;
+    const unsigned long smbus_read_word = I2C_FUNC_SMBUS_READ_WORD_DATA;
+    std::vector<std::uint8_t> capabilities(sizeof(smbus_read_word));
+    std::memcpy(capabilities.data(), &smbus_read_word, sizeof(smbus_read_word));
+    fake.descriptors[101].replies[I2C_SLAVE] = {0};
+    fake.descriptors[101].replies[I2C_FUNCS] = capabilities;
+    const std::uint16_t raw = 0x1234;
+    std::vector<std::uint8_t> word(sizeof(raw));
+    std::memcpy(word.data(), &raw, sizeof(raw));
+    fake.descriptors[101].replies[I2C_SMBUS] = word;
+    auto config = policy();
+    config.backend = "i2c";
+    config.path = "/dev/fake-i2c,0x48,0x00";
+    config.scale = 0.0625;
+    auto reader = bmc::make_reader(config, fake);
+    const auto sample = reader->read();
+    ASSERT_TRUE(sample);
+    EXPECT_DOUBLE_EQ(*sample, 0x1234 * 0.0625);
+    EXPECT_EQ(decode_i2c_word(fake.descriptors[101].replies[I2C_SMBUS]), raw);
+    EXPECT_EQ(read_i2c_functions(fake), smbus_read_word);
+    EXPECT_EQ(fake.selected_slaves, 1);
+    EXPECT_EQ(fake.opened.size(), 1u);
+    EXPECT_EQ(fake.opened[0], "/dev/fake-i2c");
+}
+TEST(FakeIo, GpioReaderRejectsOffsetOutsideChipBeforeRequestingTheLine) {
+    FakeLinuxIo fake;
+    fake.gpio_lines = 8;
+    fake.descriptors[101].replies[GPIO_GET_CHIPINFO_IOCTL] = {0};
+    auto config = policy();
+    config.backend = "gpio";
+    config.path = "/dev/fake-gpiochip,8";
+    EXPECT_THROW(bmc::make_reader(config, fake), std::invalid_argument);
+}
 TEST(Device, RegistryProvidesLifecycleAndInventory) {
     auto config = policy();
-    auto device = bmc::make_device(config);
+    auto device = bmc::make_device(config, bmc::system_io());
     EXPECT_EQ(device->state(), bmc::DeviceState::closed);
     EXPECT_TRUE(device->open());
     EXPECT_EQ(device->state(), bmc::DeviceState::ready);
@@ -183,14 +355,14 @@ TEST(Device, RegistryProvidesLifecycleAndInventory) {
 TEST(Device, RegistryRejectsDuplicateIds) {
     auto config = policy();
     bmc::DeviceRegistry registry;
-    registry.add(bmc::make_device(config));
-    EXPECT_THROW(registry.add(bmc::make_device(config)), std::invalid_argument);
+    registry.add(bmc::make_device(config, bmc::system_io()));
+    EXPECT_THROW(registry.add(bmc::make_device(config, bmc::system_io())), std::invalid_argument);
 }
 TEST(Device, SysfsAdapterReportsDegradedState) {
     auto config = policy();
     config.backend = "sysfs";
     config.path = "/definitely/missing/bmc-sensor";
-    auto device = bmc::make_device(config);
+    auto device = bmc::make_device(config, bmc::system_io());
     EXPECT_FALSE(device->open());
     EXPECT_EQ(device->state(), bmc::DeviceState::failed);
     EXPECT_FALSE(device->probe());
@@ -267,14 +439,14 @@ TEST(Gpio, RejectsMalformedPathsBeforeOpeningHardware) {
     config.backend = "gpio";
     for (const auto& path : {"/dev/gpiochip0", "/dev/gpiochip0,-1", "/dev/gpiochip0,1,invalid", "/dev/gpiochip0,4294967296"}) {
         config.path = path;
-        EXPECT_THROW(bmc::make_reader(config), std::invalid_argument);
+        EXPECT_THROW(bmc::make_reader(config, bmc::system_io()), std::invalid_argument);
     }
 }
 TEST(Gpio, MissingDeviceCanRetryAndCloseSafely) {
     auto config = policy();
     config.backend = "gpio";
     config.path = "/definitely/missing/gpiochip,0";
-    auto device = bmc::make_device(config);
+    auto device = bmc::make_device(config, bmc::system_io());
     EXPECT_FALSE(device->open());
     EXPECT_EQ(device->state(), bmc::DeviceState::failed);
     EXPECT_FALSE(device->read_value());

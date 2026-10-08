@@ -5,15 +5,19 @@
 #include <atomic>
 #include <cerrno>
 #include <csignal>
+#include <filesystem>
 #include <fcntl.h>
 #include <iostream>
+#include <optional>
 #include <pthread.h>
 #include <stdexcept>
+#include <string>
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
 #include <system_error>
 #include <unistd.h>
+#include <vector>
 
 namespace {
 struct Options {
@@ -111,11 +115,13 @@ int run(const Options& settings) {
         logger.action(event.source, "event-bus:" + event.message);
     });
     std::atomic_bool worker_failed = false;
-    auto sensors = bmc::prepare_sensors(settings.config);
+    // 进程唯一的系统调用入口：设备读取与动作写入都经它注入，测试可替换为 FakeLinuxIo。
+    bmc::PosixLinuxIo io;
+    auto sensors = bmc::prepare_sensors(settings.config, io);
     bmc::FaultRuleEngine rules(std::filesystem::exists(settings.rules) ? bmc::load_rules(settings.rules) : std::vector<bmc::FaultRule>{});
     // 应用入口选择真实或模拟动作；恢复引擎仅负责去重、重试和冷却。
     std::shared_ptr<bmc::Action> action;
-    if (settings.enable_actions) action = std::make_shared<bmc::PwmAction>();
+    if (settings.enable_actions) action = std::make_shared<bmc::PwmAction>(io);
     else action = std::make_shared<bmc::LogOnlyAction>();
     bmc::RecoveryPolicyEngine recovery([action](const bmc::RecoveryRequest& request) {
         return action->execute(request);
@@ -172,7 +178,7 @@ int run(const Options& settings) {
                 }
                 if (info.ssi_signo == SIGHUP) {
                     try {
-                        auto replacement = bmc::prepare_sensors(settings.config);
+                        auto replacement = bmc::prepare_sensors(settings.config, io);
                         bmc::FaultRuleEngine replacement_rules(std::filesystem::exists(settings.rules) ? bmc::load_rules(settings.rules) : std::vector<bmc::FaultRule>{});
                         const auto message = "validated generation " + std::to_string(config_generation + 1);
                         logger.action("configuration", message);
@@ -232,7 +238,8 @@ int main(int count, char** arguments) {
         }
         const auto settings = options(count, arguments);
         if (settings.check_config) {
-            const auto sensors = bmc::prepare_sensors(settings.config);
+            bmc::PosixLinuxIo io;
+            const auto sensors = bmc::prepare_sensors(settings.config, io);
             bmc::FaultRuleEngine validated_rules(std::filesystem::exists(settings.rules) ? bmc::load_rules(settings.rules) : std::vector<bmc::FaultRule>{});
             std::cout << "configuration valid: " << sensors.size() << " sensors\n";
             return 0;

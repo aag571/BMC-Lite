@@ -1,25 +1,8 @@
 #include "bmc/core.hpp"
-#include <algorithm>
-#include <cerrno>
-#include <cmath>
-#include <fcntl.h>
-#include <iomanip>
-#include <linux/i2c-dev.h>
-#include <linux/i2c.h>
-#include <linux/gpio.h>
-#include <cstring>
-#include <set>
-#include <sstream>
 #include <stdexcept>
-#include <system_error>
-#include <sys/ioctl.h>
-#include <unistd.h>
-#include <utility>
-#include <ctime>
+#include <thread>
 
 namespace bmc {
-namespace {
-}
 EventBus::EventBus(std::size_t capacity) : capacity_(capacity) {
     if (capacity == 0) throw std::invalid_argument("zero event bus capacity");
     thread_ = std::thread(&EventBus::dispatch, this);

@@ -33,6 +33,8 @@ if(BUILD_TESTING)
   FetchContent_MakeAvailable(googletest)
   add_executable(bmc_tests tests/core_test.cpp)
   target_link_libraries(bmc_tests PRIVATE bmc_core GTest::gtest_main)
+  # 测试直接使用 bmc/action.hpp 与 bmc/linux_io.hpp，显式声明而非依赖传递包含。
+  target_include_directories(bmc_tests PRIVATE include)
   include(GoogleTest)
   gtest_discover_tests(bmc_tests)
   add_executable(bmc_stress tests/stress_test.cpp)

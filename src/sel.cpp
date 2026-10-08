@@ -1,21 +1,12 @@
 #include "bmc/core.hpp"
 #include <algorithm>
-#include <cerrno>
+#include <chrono>
 #include <cmath>
-#include <fcntl.h>
+#include <fstream>
 #include <iomanip>
-#include <linux/i2c-dev.h>
-#include <linux/i2c.h>
-#include <linux/gpio.h>
-#include <cstring>
-#include <set>
 #include <sstream>
 #include <stdexcept>
-#include <system_error>
-#include <sys/ioctl.h>
-#include <unistd.h>
-#include <utility>
-#include <ctime>
+#include <vector>
 
 namespace bmc {
 namespace {
