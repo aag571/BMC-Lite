@@ -1,7 +1,10 @@
 #include "bmc/core.hpp"
 #include "bmc/action.hpp"
+#include "bmc/chip.hpp"
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <gtest/gtest.h>
@@ -9,8 +12,11 @@
 #include <linux/gpio.h>
 #include <linux/i2c-dev.h>
 #include <linux/i2c.h>
+#include <fstream>
 #include <future>
+#include <initializer_list>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unistd.h>
@@ -32,6 +38,8 @@ class FakeLinuxIo final : public bmc::LinuxIo {
 public:
     struct Descriptor {
         std::map<unsigned long, std::vector<std::uint8_t>> replies;
+        // SMBus 写：命令码 -> 写下的值，供断言芯片初始化（例如写入校准寄存器）。
+        std::map<std::uint8_t, std::uint16_t> registers;
         std::vector<std::string> writes;
         bool short_write = false;
     };
@@ -58,21 +66,65 @@ public:
             return -1;
         }
         auto& entry = found->second;
-        const auto reply = entry.replies.find(request);
-        if (reply == entry.replies.end()) {
+        // SMBus 请求码在本文件里被当作"任意寄存器读"的标记：具体寄存器号在 transaction->command。
+        // 因此读应答的键是：字节读用命令码（一个命令一个序列），字/块读用 I2C_SMBUS。
+        const bool is_smbus = request == I2C_SMBUS;
+        auto* transaction = is_smbus ? static_cast<i2c_smbus_ioctl_data*>(argument) : nullptr;
+        const bool is_smbus_write = is_smbus && transaction->read_write == I2C_SMBUS_WRITE;
+        const unsigned long reply_key = !is_smbus ? request
+            : (transaction->size == I2C_SMBUS_BYTE_DATA ? transaction->command : request);
+        const auto reply = entry.replies.find(reply_key);
+        // 不需要回复脚本的四类：纯成功型（I2C_SLAVE、GPIO_V2_GET_LINE_IOCTL）、
+        // 内容由测试成员提供（I2C_FUNCS、GPIO_GET_CHIPINFO_IOCTL）、线值读（缺省为 0）、写事务。
+        const bool needs_reply = request != I2C_SLAVE && request != I2C_FUNCS &&
+            request != GPIO_GET_CHIPINFO_IOCTL && request != GPIO_V2_GET_LINE_IOCTL &&
+            request != GPIO_V2_LINE_GET_VALUES_IOCTL && !is_smbus_write;
+        if (needs_reply && reply == entry.replies.end()) {
             errno = ENOTTY;
             return -1;
         }
-        // 回填假数据，模拟内核对调用方传入结构体的写入。未显式回填的请求
-        // （I2C_SLAVE、GPIO_V2_GET_LINE_IOCTL）属于"纯成功"型 ioctl：在 replies 里登记即表示成功。
+        // 取本次应答：序列长度大于 1 时消费队首，只剩一个元素时反复返回它。
+        auto take_byte = [&entry](unsigned long key) -> std::uint8_t {
+            auto& bytes = entry.replies[key];
+            const std::uint8_t value = bytes.front();
+            if (bytes.size() > 1) {
+                bytes.erase(bytes.begin());
+            }
+            return value;
+        };
+        // 回填假数据，模拟内核对调用方传入结构体的写入。
         if (request == I2C_SLAVE) {
             ++selected_slaves;
         } else if (request == I2C_FUNCS) {
             *static_cast<unsigned long*>(argument) = i2c_functions;
-        } else if (request == I2C_SMBUS) {
-            auto* transaction = static_cast<i2c_smbus_ioctl_data*>(argument);
+        } else if (is_smbus) {
             auto* data = static_cast<i2c_smbus_data*>(transaction->data);
-            std::memcpy(&data->word, reply->second.data(), sizeof(data->word));
+            if (is_smbus_write) {
+                // 写事务没有回复脚本，登记即表示成功；按尺寸记录写入内容。
+                ++smbus_writes;
+                if (transaction->size == I2C_SMBUS_BYTE_DATA) {
+                    entry.registers[transaction->command] = data->byte;
+                } else {
+                    entry.registers[transaction->command] = static_cast<std::uint16_t>(data->word);
+                }
+            } else if (transaction->size == I2C_SMBUS_BYTE_DATA) {
+                data->byte = take_byte(transaction->command);
+            } else if (transaction->size == I2C_SMBUS_I2C_BLOCK_DATA) {
+                auto& bytes = entry.replies[request];
+                const std::size_t count = std::min<std::size_t>(bytes.size(), 32);
+                data->block[0] = static_cast<std::uint8_t>(count);
+                std::memcpy(data->block + 1, bytes.data(), count);
+            } else {
+                // 读应答按 ioctl 请求码（I2C_SMBUS）登记，因为该请求表示"任意寄存器读"，
+                // 寄存器号只出现在 transaction->command 中。此处不能再使用 reply 迭代器：
+                // take_byte/operator[] 会修改 entry.replies 使其失效。
+                std::uint16_t word = 0;
+                const auto& bytes = entry.replies[request];
+                if (!bytes.empty()) {
+                    std::memcpy(&word, bytes.data(), sizeof(word));
+                }
+                data->word = word;
+            }
         } else if (request == GPIO_GET_CHIPINFO_IOCTL) {
             static_cast<gpiochip_info*>(argument)->lines = gpio_lines;
         } else if (request == GPIO_V2_GET_LINE_IOCTL) {
@@ -82,7 +134,9 @@ public:
             // 因此 GPIO 的覆盖范围止于"请求参数构造"，line fd 的生命周期仍需实机或 QEMU 验证。
             line_request->fd = -1;
         } else if (request == GPIO_V2_LINE_GET_VALUES_IOCTL) {
-            static_cast<gpio_v2_line_values*>(argument)->bits = reply->second.at(0);
+            const auto bits = entry.replies.find(request);
+            static_cast<gpio_v2_line_values*>(argument)->bits =
+                bits == entry.replies.end() || bits->second.empty() ? 0 : bits->second.at(0);
         }
         return 0;
     }
@@ -102,7 +156,7 @@ public:
         }
         return static_cast<ssize_t>(count);
     }
-    unsigned long i2c_functions = I2C_FUNC_SMBUS_READ_WORD_DATA;
+    unsigned long i2c_functions = I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_SMBUS_WORD_DATA | I2C_FUNC_SMBUS_READ_WORD_DATA;
     std::uint32_t gpio_lines = 32;
     std::map<std::string, int> path_descriptors;
     std::map<int, Descriptor> descriptors;
@@ -110,6 +164,7 @@ public:
     std::vector<std::string> opened;
     int ioctls = 0;
     int selected_slaves = 0;
+    int smbus_writes = 0;
     int next_descriptor = 101;
 };
 TEST(Engine, DebouncesCriticalAndUsesInclusiveBoundary) {
@@ -257,6 +312,271 @@ TEST(Pwm, ValidatesAndWritesConfiguredFile) {
     unsigned value = 0;
     input >> value;
     EXPECT_EQ(value, 255u);
+    std::filesystem::remove(path);
+}
+TEST(Calibration, DefaultIsIdentityAndLinearTermsApply) {
+    bmc::Calibration identity;
+    EXPECT_DOUBLE_EQ(bmc::apply(identity, 42.5), 42.5);
+    bmc::Calibration linear;
+    linear.gain = 2;
+    linear.offset = -3;
+    EXPECT_DOUBLE_EQ(bmc::apply(linear, 10), 17);
+    EXPECT_THROW(bmc::apply(identity, std::numeric_limits<double>::quiet_NaN()), std::invalid_argument);
+}
+TEST(Calibration, InterpolatesBetweenPointsAndClampsOutside) {
+    bmc::Calibration calibration;
+    calibration.points = {{0, 100}, {10, 200}, {20, 260}};
+    // 各校准点上取精确值。
+    EXPECT_DOUBLE_EQ(bmc::apply(calibration, 0), 100);
+    EXPECT_DOUBLE_EQ(bmc::apply(calibration, 10), 200);
+    EXPECT_DOUBLE_EQ(bmc::apply(calibration, 20), 260);
+    // 段内线性插值：0..10 段斜率 10，10..20 段斜率 6。
+    EXPECT_DOUBLE_EQ(bmc::apply(calibration, 5), 150);
+    EXPECT_DOUBLE_EQ(bmc::apply(calibration, 15), 230);
+    // 区间外按端点钳制，不外推。
+    EXPECT_DOUBLE_EQ(bmc::apply(calibration, -5), 100);
+    EXPECT_DOUBLE_EQ(bmc::apply(calibration, 100), 260);
+}
+TEST(Calibration, LinearTermsApplyBeforeInterpolation) {
+    bmc::Calibration calibration;
+    calibration.gain = 10;
+    calibration.offset = 5;
+    calibration.points = {{100, 1}, {200, 2}};
+    // raw=5 -> 55 -> 落在首点之前 -> 钳制为 1；raw=15 -> 155 -> 位于 100..200 的 55% -> 1.55。
+    EXPECT_DOUBLE_EQ(bmc::apply(calibration, 5), 1);
+    EXPECT_DOUBLE_EQ(bmc::apply(calibration, 15), 1.55);
+}
+TEST(Calibration, ValidateRejectsUnsortedOrNonFinitePoints) {
+    auto config = policy();
+    config.calibration.points = {{10, 1}, {5, 2}};
+    EXPECT_THROW(bmc::validate(config), std::invalid_argument);
+    config = policy();
+    config.calibration.points = {{5, 1}, {5, 2}};
+    EXPECT_THROW(bmc::validate(config), std::invalid_argument);
+    config = policy();
+    config.calibration.points = {{5, std::numeric_limits<double>::infinity()}};
+    EXPECT_THROW(bmc::validate(config), std::invalid_argument);
+    config = policy();
+    config.calibration.gain = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_THROW(bmc::validate(config), std::invalid_argument);
+    config = policy();
+    config.calibration.points = {{5, 1}, {10, 2}};
+    EXPECT_NO_THROW(bmc::validate(config));
+}
+TEST(Calibration, ConfigLineParsesOptionalTwelfthField) {
+    const auto path = temporary("-calibration");
+    // 旧格式（11 字段）保持可用，标定为默认恒等。
+    { std::ofstream output(path); output << "cpu mock 40 1 high 70 90 3 3 3 -\n"; }
+    auto configs = bmc::load_config(path);
+    ASSERT_EQ(configs.size(), 1u);
+    EXPECT_DOUBLE_EQ(configs[0].calibration.gain, 1);
+    EXPECT_TRUE(configs[0].calibration.points.empty());
+    // 新格式：gain:offset;raw=value;raw=value
+    { std::ofstream output(path); output << "cpu mock 40 1 high 70 90 3 3 3 - 1.5:-2;0=10;100=210\n"; }
+    configs = bmc::load_config(path);
+    ASSERT_EQ(configs.size(), 1u);
+    EXPECT_DOUBLE_EQ(configs[0].calibration.gain, 1.5);
+    EXPECT_DOUBLE_EQ(configs[0].calibration.offset, -2);
+    ASSERT_EQ(configs[0].calibration.points.size(), 2u);
+    EXPECT_DOUBLE_EQ(configs[0].calibration.points[0].first, 0);
+    EXPECT_DOUBLE_EQ(configs[0].calibration.points[1].second, 210);
+    // "-" 与省略等价。
+    { std::ofstream output(path); output << "cpu mock 40 1 high 70 90 3 3 3 - -\n"; }
+    configs = bmc::load_config(path);
+    ASSERT_EQ(configs.size(), 1u);
+    EXPECT_TRUE(configs[0].calibration.points.empty());
+    // 乱序校准点在加载时即被拒绝。
+    { std::ofstream output(path); output << "cpu mock 40 1 high 70 90 3 3 3 - 1;50=1;10=2\n"; }
+    EXPECT_THROW(bmc::load_config(path), std::invalid_argument);
+    std::filesystem::remove(path);
+}
+// 以下是专用芯片驱动的寄存器语义用例：只验证解码与换算，不验证电气行为。
+// 脚本直接挂在 open() 会分配的 101 号描述符上。
+namespace {
+// 芯片用例的公共前置：登记 I2C_SLAVE 与能力位。能力位的实际内容取自 i2c_functions，
+// 因此这里只需登记请求存在；需要"能力不足"的用例直接改 i2c_functions 即可。
+void expect_chip_bus(FakeLinuxIo& fake) {
+    fake.descriptors[101].replies[I2C_SLAVE] = {0};
+    fake.descriptors[101].replies[I2C_FUNCS] = {0};
+}
+// SMBus word 读由内核还原字节序，因此这里按"低字节在前"给出寄存器内容。
+std::vector<std::uint8_t> smbus_word_bytes(std::uint16_t value) {
+    return {static_cast<std::uint8_t>(value & 0xFF), static_cast<std::uint8_t>(value >> 8)};
+}
+// 字/块读的回复以 ioctl 请求码（I2C_SMBUS）为键，word 内容用 smbus_word_bytes 构造。
+// 注意：对 word 读而言 transaction->command 是寄存器号，只有字节读才以命令码为键。
+void expect_reply(FakeLinuxIo& fake, unsigned long request, std::vector<std::uint8_t> bytes) {
+    fake.descriptors[101].replies[request] = std::move(bytes);
+}
+// 字节读（read_byte）的回复以寄存器命令码为键；同一命令给多个元素表示连续多次读依次返回。
+void expect_byte(FakeLinuxIo& fake, std::uint8_t command, std::vector<std::uint8_t> bytes) {
+    fake.descriptors[101].replies[command] = std::move(bytes);
+}
+std::unique_ptr<bmc::I2cBus> make_bus(FakeLinuxIo& fake) {
+    return std::make_unique<bmc::I2cBus>("/dev/fake-chip", 0x48, fake);
+}
+}
+TEST(ChipLm75, DecodesElevenBitTwosComplementTemperature) {
+    FakeLinuxIo fake;
+    expect_chip_bus(fake);
+    // 0x1F40 >> 5 == 250 -> 31.25 C
+    expect_reply(fake, I2C_SMBUS, smbus_word_bytes(0x1F40));
+    auto bus = make_bus(fake);
+    auto driver = bmc::make_chip("lm75b", *bus, "");
+    const auto sample = driver->read("temp");
+    ASSERT_TRUE(sample);
+    EXPECT_DOUBLE_EQ(*sample, 31.25);
+    // 0xFFF8 >> 5 == -1 -> -0.125 C
+    fake.descriptors[101].replies[I2C_SMBUS] = smbus_word_bytes(0xFFF8);
+    const auto negative = driver->read("temp");
+    ASSERT_TRUE(negative);
+    EXPECT_DOUBLE_EQ(*negative, -0.125);
+}
+TEST(ChipLm75, NineBitVariantUsesHalfDegreeSteps) {
+    FakeLinuxIo fake;
+    expect_chip_bus(fake);
+    // 9 位：0xFF00 >> 7 == -2 -> -1.0 C；0x0180 >> 7 == 3 -> 1.5 C（低 7 位为精度位，本实现保留）。
+    expect_reply(fake, I2C_SMBUS, smbus_word_bytes(0xFF00));
+    auto bus = make_bus(fake);
+    auto driver = bmc::make_chip("lm75", *bus, "");
+    const auto sample = driver->read("temp");
+    ASSERT_TRUE(sample);
+    EXPECT_DOUBLE_EQ(*sample, -1.0);
+    fake.descriptors[101].replies[I2C_SMBUS] = smbus_word_bytes(0x0180);
+    const auto half = driver->read("temp");
+    ASSERT_TRUE(half);
+    EXPECT_DOUBLE_EQ(*half, 1.5);
+}
+TEST(ChipSelection, RejectsUnknownChipAndUnsupportedFeature) {
+    FakeLinuxIo fake;
+    expect_chip_bus(fake);
+    auto bus = make_bus(fake);
+    EXPECT_THROW(bmc::make_chip("lm99", *bus, ""), std::invalid_argument);
+    // lm75 只有 temp，没有 bus。
+    EXPECT_THROW(bmc::make_chip("lm75", *bus, "bus"), std::invalid_argument);
+    EXPECT_NO_THROW(bmc::make_chip("lm75b", *bus, "temp"));
+}
+TEST(ChipAdm1275, AppliesTwelveBitMaskAndHalfCodeOffset) {
+    FakeLinuxIo fake;
+    expect_chip_bus(fake);
+    // READ_VIN 0x88：高 4 位保留，取 bit11:0；0x1234 & 0x0FFF = 0x234 = 564。
+    fake.descriptors[101].replies[0x88] = smbus_word_bytes(0x1234);
+    auto bus = make_bus(fake);
+    auto driver = bmc::make_chip("adm1275", *bus, "");
+    const auto voltage = driver->read("vin");
+    ASSERT_TRUE(voltage);
+    // 默认 0-20 V 量程的 LSB 为 5.208 mV，且电压采用 code + 0.5 偏移。
+    EXPECT_NEAR(*voltage, 5.208e-3 * 564.5, 1e-9);
+    // 未配置分流电阻时无法给出电流的安培值。
+    fake.descriptors[101].replies[0x8C] = smbus_word_bytes(0x0800);
+    EXPECT_FALSE(driver->read("iout"));
+    // 该芯片没有功率与温度命令。
+    EXPECT_FALSE(driver->read("power"));
+    EXPECT_FALSE(driver->read("temp"));
+}
+TEST(ChipIna219, ProgrammesCalibrationAndShiftsBusVoltage) {
+    FakeLinuxIo fake;
+    expect_chip_bus(fake);
+    // 母线电压数据在 bit15:3，bit1=CNVR、bit0=OVF 必须被右移丢弃。
+    expect_reply(fake, I2C_SMBUS, smbus_word_bytes(static_cast<std::uint16_t>((3000u << 3) | 0x3)));
+    auto bus = make_bus(fake);
+    auto driver = bmc::make_chip("ina219", *bus, "bus");
+    const auto voltage = driver->read("bus");
+    ASSERT_TRUE(voltage);
+    EXPECT_DOUBLE_EQ(*voltage, 12.0);  // 3000 * 4 mV
+    // 构造时应写入默认校准值 4096，且 INA219 的 FS0 恒为 0。
+    ASSERT_EQ(fake.descriptors[101].registers.count(0x05), 1u);
+    EXPECT_EQ(fake.descriptors[101].registers[0x05], 4096u);
+    EXPECT_EQ(fake.smbus_writes, 1);
+}
+TEST(ChipIna219, ShuntVoltageIsSigned) {
+    FakeLinuxIo fake;
+    expect_chip_bus(fake);
+    expect_reply(fake, I2C_SMBUS, smbus_word_bytes(static_cast<std::uint16_t>(-100)));
+    auto bus = make_bus(fake);
+    auto driver = bmc::make_chip("ina219", *bus, "shunt");
+    const auto shunt = driver->read("shunt");
+    ASSERT_TRUE(shunt);
+    EXPECT_DOUBLE_EQ(*shunt, -100 * 1e-5);  // -1 mV
+}
+TEST(ChipIna226, UsesFifteenBitBusAndTwentyFivePowerFactor) {
+    FakeLinuxIo fake;
+    expect_chip_bus(fake);
+    // INA226 母线电压为 15 位无符号，不需要移位。
+    expect_reply(fake, I2C_SMBUS, smbus_word_bytes(16000));
+    auto bus = make_bus(fake);
+    auto driver = bmc::make_chip("ina226", *bus, "bus");
+    const auto voltage = driver->read("bus");
+    ASSERT_TRUE(voltage);
+    EXPECT_DOUBLE_EQ(*voltage, 20.0);  // 16000 * 1.25 mV
+    ASSERT_EQ(fake.descriptors[101].registers.count(0x05), 1u);
+    EXPECT_EQ(fake.descriptors[101].registers[0x05], 2048u);
+    // 默认校准下 Current_LSB 等于分流 LSB（2.5 uV），功率 LSB 为其 25 倍。
+    fake.descriptors[101].replies[I2C_SMBUS] = smbus_word_bytes(0);
+    auto power_driver = bmc::make_chip("ina226", *bus, "power");
+    fake.descriptors[101].replies[I2C_SMBUS] = smbus_word_bytes(100);
+    const auto power = power_driver->read("power");
+    ASSERT_TRUE(power);
+    EXPECT_DOUBLE_EQ(*power, 100 * 25 * 2.5e-6);
+}
+TEST(ChipEmc2103, ConvertsTachCountWithTheDatasheetConstant) {
+    FakeLinuxIo fake;
+    expect_chip_bus(fake);
+    // 高字节 0x0F、低字节 0x00 -> COUNT = (0x0F << 5) | 0 = 480。
+    // RPM = 3932160 * 2 / 480 = 16384（默认 1000 RPM 量程，m = 2）。
+    expect_byte(fake, 0x4E, {0x0F});
+    expect_byte(fake, 0x4F, {0x00});    auto bus = make_bus(fake);
+    auto driver = bmc::make_chip("emc2103", *bus, "rpm");
+    const auto rpm = driver->read("rpm");
+    ASSERT_TRUE(rpm);
+    EXPECT_DOUBLE_EQ(*rpm, 3932160.0 * 2 / 480);
+}
+TEST(ChipEmc2103, StoppedTachSentinelAndZeroAreNotSpeeds) {
+    FakeLinuxIo fake;
+    expect_chip_bus(fake);
+    // 0x1FE0 是寄存器默认值，表示风扇停转或未接：COUNT = (0xFF << 5) | (0xF8 >> 3) = 0x1FE0。
+    expect_byte(fake, 0x4E, {0xFF});
+    expect_byte(fake, 0x4F, {0xF8});
+    auto bus = make_bus(fake);
+    auto driver = bmc::make_chip("emc2103", *bus, "rpm");
+    EXPECT_FALSE(driver->read("rpm"));
+}
+TEST(ChipEmc2103, TemperatureIsSixteenthDegreeAndDiodeFaultIsNotATemperature) {
+    FakeLinuxIo fake;
+    expect_chip_bus(fake);
+    expect_byte(fake, 0x00, {0x1F});  // internal temperature high byte
+    expect_byte(fake, 0x01, {0x40});  // low byte -> 0x1F40 / 256 = 31.25 C
+    auto bus = make_bus(fake);
+    auto driver = bmc::make_chip("emc2103", *bus, "temp");
+    const auto warm = driver->read("temp");
+    ASSERT_TRUE(warm);
+    EXPECT_DOUBLE_EQ(*warm, 31.25);
+    // 负温度：0xFF00 / 256 = -1.0 C
+    fake.descriptors[101].replies[0x00] = {0xFF};
+    fake.descriptors[101].replies[0x01] = {0x00};
+    const auto cold = driver->read("temp");
+    ASSERT_TRUE(cold);
+    EXPECT_DOUBLE_EQ(*cold, -1.0);
+    // 0x8000 表示二极管故障，必须报"无读数"而不是 -128 C。
+    fake.descriptors[101].replies[0x00] = {0x80};
+    fake.descriptors[101].replies[0x01] = {0x00};
+    EXPECT_FALSE(driver->read("temp"));
+}
+TEST(ChipConfig, ChipBackendParsesAndRejectsUnknownNames) {
+    const auto path = temporary("-chip");
+    { std::ofstream output(path); output << "temp i2c:lm75b /dev/i2c-1,0x48 1 high 70 90 3 3 3 -\n"; }
+    auto configs = bmc::load_config(path);
+    ASSERT_EQ(configs.size(), 1u);
+    EXPECT_EQ(configs[0].backend, "i2c:lm75b");
+    { std::ofstream output(path); output << "temp i2c:lm99 /dev/i2c-1,0x48 1 high 70 90 3 3 3 -\n"; }
+    EXPECT_THROW(bmc::load_config(path), std::invalid_argument);
+    { std::ofstream output(path); output << "temp i2c:lm75 /dev/i2c-1,0x48,0x00 1 high 70 90 3 3 3 -\n"; }
+    configs = bmc::load_config(path);
+    ASSERT_EQ(configs.size(), 1u);
+    FakeLinuxIo fake;
+    expect_chip_bus(fake);
+    // 芯片后端的 path 只接受 device,address，多给寄存器字段即报错。
+    EXPECT_THROW(bmc::make_reader(configs[0], fake), std::invalid_argument);
     std::filesystem::remove(path);
 }
 // 以下用例验证"注入后的调用链"，而不是真实硬件行为。

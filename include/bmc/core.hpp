@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unordered_map>
 
@@ -61,6 +62,14 @@ public:
 private:
     int value_;
 };
+// 多点标定：raw 经 gain/offset 线性修正后，再按校准点做分段线性插值。
+// 空的 points 表示纯线性转换，行为与只使用 scale 时一致。
+struct Calibration {
+    double gain = 1;
+    double offset = 0;
+    std::vector<std::pair<double, double>> points;
+};
+double apply(const Calibration& calibration, double raw);
 struct Config {
     std::string id;
     std::string backend;
@@ -73,6 +82,7 @@ struct Config {
     unsigned debounce = 3;
     unsigned failure_limit = 3;
     std::string action_path;
+    Calibration calibration;
 };
 std::vector<Config> load_config(const std::filesystem::path& path);
 void validate(const Config& config);

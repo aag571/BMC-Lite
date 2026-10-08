@@ -8,7 +8,8 @@ option(BMC_TSAN "Enable ThreadSanitizer" OFF)
 find_package(Threads REQUIRED)
 add_library(bmc_core src/sel.cpp src/state.cpp src/event_bus.cpp src/fd.cpp
   src/config.cpp src/rules.cpp src/recovery.cpp src/engine.cpp src/readers.cpp
-  src/logger.cpp src/worker.cpp src/actions.cpp src/monitor.cpp src/linux_io.cpp)
+  src/logger.cpp src/worker.cpp src/actions.cpp src/monitor.cpp src/linux_io.cpp
+  src/calibration.cpp src/chips.cpp)
 target_include_directories(bmc_core PUBLIC include)
 target_link_libraries(bmc_core PUBLIC Threads::Threads)
 target_compile_options(bmc_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
@@ -53,4 +54,4 @@ if(BUILD_TESTING)
 endif()
 install(TARGETS bmc-lite RUNTIME DESTINATION bin)
 install(FILES config/mock.conf config/hardware.conf.example config/rules.conf DESTINATION share/bmc-lite/config)
-install(FILES docs/architecture.md docs/framework.md DESTINATION share/doc/bmc-lite)
+install(FILES docs/architecture.md docs/framework.md docs/chips.md DESTINATION share/doc/bmc-lite)

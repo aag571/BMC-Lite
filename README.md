@@ -15,9 +15,9 @@ ctest --test-dir build --output-on-failure
 
 ## 配置
 
-每行字段为 id backend path scale direction warning critical hysteresis debounce failure_limit action_path。示例见 config。mock 序列循环播放。阈值等值算异常；迟滞边界等值保持故障状态。读取失败打断连续异常去抖，连续失败确认 unavailable，重新读取成功后也需要确认窗口。
+每行字段为 id backend path scale direction warning critical hysteresis debounce failure_limit action_path [calibration]。示例见 config。mock 序列循环播放。阈值等值算异常；迟滞边界等值保持故障状态。读取失败打断连续异常去抖，连续失败确认 unavailable，重新读取成功后也需要确认窗口。
 
-I2C 示例是原始无符号 SMBus word，比例由配置决定；不同芯片的符号、字节序和专用协议需要专用适配器，不能直接把示例作为真实温度驱动。GPIO 参数使用已经导出并配置 edge 的旧 sysfs value 节点，现代 GPIO character-device API 尚未实现。
+I2C 有两种后端：`i2c` 是原始无符号 SMBus word，比例由配置决定；`i2c:<chip>[@<feature>]` 走专用芯片驱动，支持 lm75 / lm75b / emc2103 / adm1275 / ina219 / ina226，负责符号扩展、字节序、位域与 LSB 换算。可选的标定字段形如 `gain[:offset][;raw=value;...]`，先线性修正再做分段线性插值（区间外钳制）。寄存器依据与已知限制见 docs/chips.md。GPIO 参数使用已经导出并配置 edge 的旧 sysfs value 节点，现代 GPIO character-device API 尚未实现。
 
 ## 运行
 
@@ -26,7 +26,7 @@ I2C 示例是原始无符号 SMBus word，比例由配置决定；不同芯片�
 ./build/bmc-lite --config config/hardware.conf --gpio /sys/class/gpio/gpio23/value
 ```
 
-SIGTERM/SIGINT 有序停止并 drain 恢复队列。Critical 状态变化可提交一次恢复，冷却 30 秒。当前不对持续 Critical 自动重试。日志写入失败退出服务。没有网络管理面、关机/复位脚本或硬件特定驱动。
+SIGTERM/SIGINT 有序停止并 drain 恢复队列。Critical 状态变化可提交一次恢复，冷却 30 秒。当前不对持续 Critical 自动重试。日志写入失败退出服务。没有网络管理面、关机/复位脚本。硬件专用驱动只覆盖 docs/chips.md 列出的六种型号，其余芯片仍需 `i2c` 原始寄存器后端加标定。
 
 ## 完成度
 

@@ -1,13 +1,16 @@
 # 代码阅读指南
 
-建议阅读顺序：core.hpp 的领域模型 → engine.cpp → config.cpp → readers.cpp → monitor.hpp/monitor.cpp → main.cpp → worker.cpp/recovery.cpp。
+建议阅读顺序：core.hpp 的领域模型 → engine.cpp → config.cpp → calibration.cpp → readers.cpp → chips.cpp → monitor.hpp/monitor.cpp → main.cpp → worker.cpp/recovery.cpp。
 
 ## 文件职责
 
 - engine.cpp：纯数值判断、迟滞、连续样本确认，不访问文件和设备。
-- config.cpp：传感器配置解析与验证。
+- calibration.cpp：gain/offset 线性修正与分段线性插值（区间外钳制）。
+- config.cpp：传感器配置解析与验证（含可选的标定字段与 `i2c:<chip>` 后端）。
 - rules.cpp：规则文件解析、每传感器规则状态与激活/清除。
-- readers.cpp：mock/sysfs/I2C/GPIO 读取、设备适配与注册。
+- readers.cpp：mock/sysfs/原始 I2C/GPIO 读取、设备适配与注册。
+- chips.cpp：I2C 总线封装（I2cBus）与专用芯片驱动（LM75、EMC2103、ADM1275、INA219/INA226）。
+  寄存器语义与换算依据见 docs/chips.md。
 - actions.cpp 与 action.hpp：PWM 系统调用和可替换动作策略。
 - monitor.cpp：采样、状态持久化、规则判断、异步恢复提交。
 - main.cpp：参数解析、应用依赖构造、Linux epoll/timerfd/signalfd 调度和重载。
@@ -15,6 +18,7 @@
 - event_bus.cpp：异步通知、类型过滤和背压。
 - logger.cpp、sel.cpp：滚动日志与事件存储。
 - fd.cpp：独占文件描述符所有权和移动语义。
+- linux_io.cpp：系统调用注入层（PosixLinuxIo + 进程级默认实例）。
 
 ## 为什么有采样快照与状态事件两种数据
 

@@ -1,3 +1,4 @@
+#include "bmc/chip.hpp"
 #include "bmc/core.hpp"
 #include <algorithm>
 #include <cmath>
@@ -37,6 +38,15 @@ std::vector<std::string> split(const std::string& text, char separator) {
 // ioctl 的第三个参数在 I2C_SLAVE 是整数、在其余调用是结构体指针，统一经 void* 传递。
 void* as_ioctl_argument(unsigned long value) {
     return reinterpret_cast<void*>(static_cast<std::uintptr_t>(value));
+}
+// i2c 一类后端共用的地址解析：<device>,<address>，7 位地址。
+std::uint8_t parse_address(const std::string& token) {
+    std::size_t end = 0;
+    const auto address = std::stoul(token, &end, 0);
+    if (end != token.size() || address > 0x7f) {
+        throw std::invalid_argument("invalid i2c address");
+    }
+    return static_cast<std::uint8_t>(address);
 }
 }
 namespace {
@@ -81,20 +91,19 @@ private:
     std::string path_;
     double scale_;
 };
-class I2cReader final : public Reader {
+class RawI2cReader final : public Reader {
 public:
-    explicit I2cReader(const Config& config, LinuxIo& io) : io_(io), scale_(config.scale) {
+    explicit RawI2cReader(const Config& config, LinuxIo& io) : io_(io), scale_(config.scale) {
         const auto parts = split(config.path, ',');
         if (parts.size() != 3) {
             throw std::invalid_argument("i2c path requires device,address,register");
         }
-        std::size_t address_end = 0;
         std::size_t register_end = 0;
-        const auto address = std::stoul(parts[1], &address_end, 0);
         const auto register_value = std::stoul(parts[2], &register_end, 0);
-        if (address_end != parts[1].size() || register_end != parts[2].size() || address > 0x7f || register_value > 0xff) {
-            throw std::invalid_argument("invalid i2c address or register");
+        if (register_end != parts[2].size() || register_value > 0xff) {
+            throw std::invalid_argument("invalid i2c register");
         }
+        const auto address = parse_address(parts[1]);
         register_ = static_cast<std::uint8_t>(register_value);
         device_ = Fd(io_.open(parts[0], O_RDWR | O_CLOEXEC));
         if (device_.get() < 0) {
@@ -128,6 +137,45 @@ private:
     LinuxIo& io_;
     Fd device_;
     std::uint8_t register_ = 0;
+    double scale_;
+};
+// 专用芯片读取：由 ChipDriver 负责寄存器语义与换算，Reader 只负责把结果交给上层。
+// 后端的 chip 部分可以写成 "lm75" 或 "lm75@bus"（@ 后为测量量），默认取该型号的第一个测量量。
+class ChipReader final : public Reader {
+public:
+    explicit ChipReader(const Config& config, LinuxIo& io) : scale_(config.scale) {
+        const auto parts = split(config.path, ',');
+        if (parts.size() != 2 || parts[0].empty()) {
+            throw std::invalid_argument("chip path requires device,address");
+        }
+        const std::string backend = config.backend.substr(4);
+        const std::size_t at = backend.find('@');
+        const std::string chip = backend.substr(0, at);
+        std::string feature = at == std::string::npos ? std::string() : backend.substr(at + 1);
+        bus_ = std::make_unique<I2cBus>(parts[0], parse_address(parts[1]), io);
+        driver_ = make_chip(chip, *bus_, feature);
+        const auto features = driver_->features();
+        if (feature.empty()) {
+            if (features.empty()) {
+                throw std::invalid_argument("chip has no features: " + chip);
+            }
+            feature_ = features.front().name;
+        } else {
+            feature_ = std::move(feature);
+        }
+    }
+    std::optional<double> read() override {
+        const auto value = driver_->read(feature_);
+        if (!value) {
+            return std::nullopt;
+        }
+        const double scaled = *value * scale_;
+        return std::isfinite(scaled) ? std::optional<double>(scaled) : std::nullopt;
+    }
+private:
+    std::unique_ptr<I2cBus> bus_;
+    std::unique_ptr<ChipDriver> driver_;
+    std::string feature_;
     double scale_;
 };
 class GpioReader final : public Reader {
@@ -239,7 +287,11 @@ std::unique_ptr<Reader> make_reader(const Config& config, LinuxIo& io) {
     if (config.backend == "sysfs") {
         return std::make_unique<SysfsReader>(config);
     }
-    return std::make_unique<I2cReader>(config, io);
+    if (config.backend == "i2c") {
+        return std::make_unique<RawI2cReader>(config, io);
+    }
+    // 其余 i2c:<chip>[@feature] 后端走专用芯片驱动。
+    return std::make_unique<ChipReader>(config, io);
 }
 std::unique_ptr<Device> make_device(const Config& config, LinuxIo& io) {
     validate(config);

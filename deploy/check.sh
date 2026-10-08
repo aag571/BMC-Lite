@@ -13,6 +13,9 @@ require include/bmc/core.hpp
 require src/engine.cpp
 require src/monitor.cpp
 require src/readers.cpp
+require src/chips.cpp
+require src/calibration.cpp
+require src/linux_io.cpp
 require src/main.cpp
 require config/mock.conf
 require config/hardware.conf.example
