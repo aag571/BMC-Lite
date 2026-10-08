@@ -2,6 +2,11 @@
 #include "bmc/core.hpp"
 #include "bmc/monitor.hpp"
 #include "bmc/action.hpp"
+#include "bmc/network.hpp"
+#include "bmc/control.hpp"
+#include "bmc/uplink.hpp"
+#include "bmc/peer.hpp"
+#include <map>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -37,6 +42,11 @@ void add(int poller, int descriptor, std::uint32_t events) {
     }
 }
 int run(const bmc::CliOptions& settings) {
+    // OpenSSL 内部写 socket 不使用 MSG_NOSIGNAL；断开的客户端不能杀死整个 daemon。
+    struct sigaction ignore_pipe{};
+    ignore_pipe.sa_handler = SIG_IGN;
+    ::sigemptyset(&ignore_pipe.sa_mask);
+    if (::sigaction(SIGPIPE, &ignore_pipe, nullptr) < 0) fail("ignore SIGPIPE");
     sigset_t signals;
     ::sigemptyset(&signals);
     ::sigaddset(&signals, SIGINT);
@@ -49,7 +59,18 @@ int run(const bmc::CliOptions& settings) {
     }
     bmc::Logger logger(settings.log);
     bmc::SelStore sel(settings.sel);
+    // 声明在事件总线之前，异常退出时总线先排空，再释放上行回调及网络线程。
+    std::shared_ptr<bmc::Uplink> uplink;
+    if (!settings.uplink_address.empty()) {
+        uplink = std::make_shared<bmc::Uplink>(settings.uplink_address, settings.uplink_port, settings.uplink_capacity);
+        uplink->start();
+    }
     bmc::EventBus bus;
+    if (uplink) {
+        for (const auto type : {bmc::BusEventType::sensor_state, bmc::BusEventType::configuration,
+                               bmc::BusEventType::service, bmc::BusEventType::recovery})
+            bus.subscribe(type, [uplink](const bmc::BusEvent& event) { uplink->enqueue(event); });
+    }
     bus.subscribe(bmc::BusEventType::sensor_state, [&logger](const bmc::BusEvent& event) {
         logger.action(event.source, "event-bus:" + event.message);
     });
@@ -57,7 +78,12 @@ int run(const bmc::CliOptions& settings) {
     // 进程唯一的系统调用入口：设备读取与动作写入都经它注入，测试可替换为 FakeLinuxIo。
     bmc::PosixLinuxIo io;
     auto sensors = bmc::prepare_sensors(settings.config, io);
-    bmc::FaultRuleEngine rules(std::filesystem::exists(settings.rules) ? bmc::load_rules(settings.rules) : std::vector<bmc::FaultRule>{});
+    auto configured_rules = std::filesystem::exists(settings.rules) ? bmc::load_rules(settings.rules) : std::vector<bmc::FaultRule>{};
+    if (configured_rules.empty()) {
+        logger.action("configuration", "no recovery rules configured; threshold monitoring remains active");
+        sel.append("configuration", "warning", "no recovery rules configured", std::nullopt, true);
+    }
+    bmc::FaultRuleEngine rules(std::move(configured_rules));
     // 应用入口选择真实或模拟动作；恢复引擎仅负责去重、重试和冷却。
     std::shared_ptr<bmc::Action> action;
     if (settings.enable_actions) action = std::make_shared<bmc::PwmAction>(io);
@@ -67,7 +93,92 @@ int run(const bmc::CliOptions& settings) {
     }, std::chrono::seconds(30), 3, settings.worker_threads);
     bmc::Monitor monitor;
     bmc::Worker worker(settings.task_capacity, settings.worker_threads);
+    // 声明顺序保证异常退出时也先停止控制网络，再销毁回调与基础服务。
+    std::unique_ptr<bmc::ControlService> control;
+    std::unique_ptr<bmc::ReadOnlyServer> control_network;
+    bool control_started = true;
     std::uint64_t config_generation = 1;
+    auto configure_control = [&] {
+        if (!control) return;
+        std::map<std::string, std::string> paths;
+        for (const auto& sensor : sensors) paths.emplace(sensor.config.id, sensor.config.action_path);
+        control->configure(config_generation, std::move(paths));
+    };
+    if (settings.control_port != 0 || !settings.control_token_file.empty() ||
+        !settings.control_certificate.empty() || !settings.control_key.empty()) {
+        try {
+            if (settings.control_port == 0 || settings.control_token_file.empty())
+                throw std::invalid_argument("control requires port and token file together");
+            control = std::make_unique<bmc::ControlService>(bmc::load_control_token(settings.control_token_file),
+                worker, recovery, [&sel, &logger](const std::string& record) {
+                    const auto sync_failures = sel.sync_failures();
+                    sel.append("control", "audit", record, std::nullopt, true);
+                    if (!sel.flush() || sel.sync_failures() != sync_failures)
+                        throw std::runtime_error("control audit persistence failed");
+                    logger.action("control", record);
+                });
+            configure_control();
+            control_network = std::make_unique<bmc::ReadOnlyServer>(settings.control_bind, settings.control_port,
+                [&control](const bmc::http::Request& request, const std::string& peer) { return control->handle(request, peer); },
+                [&control](const std::string& peer, const std::string& reason) { control->reject(peer, reason); },
+                settings.control_certificate, settings.control_key);
+            std::string error;
+            if (!control_network->start(error)) throw std::runtime_error(error);
+        } catch (const std::exception& error) {
+            control_started = false;
+            if (control_network) control_network->stop();
+            std::cerr << "bmc-lite: control unavailable: " << error.what() << '\n';
+            logger.action("control", std::string("listener unavailable: ") + error.what());
+        }
+    }
+    std::atomic<std::uint64_t> sample_count{0};
+    std::unique_ptr<bmc::PeerHeartbeat> peer;
+    std::unique_ptr<bmc::ReadOnlyServer> peer_network;
+    bool peer_started = true;
+    if (!settings.peer_address.empty()) {
+        try {
+            peer = std::make_unique<bmc::PeerHeartbeat>(settings.peer_address, settings.peer_port,
+                bmc::load_control_token(settings.peer_token_file), std::chrono::milliseconds(settings.peer_interval_ms),
+                std::chrono::milliseconds(settings.peer_stale_ms), [&sel, &logger, &bus](const std::string& message) {
+                    sel.append("peer", "service", message, std::nullopt, true);
+                    logger.action("peer", message);
+                    bus.publish({bmc::BusEventType::service, "peer", message, std::nullopt});
+                }, settings.peer_ca, settings.peer_server_name);
+            peer_network = std::make_unique<bmc::ReadOnlyServer>(settings.peer_bind, settings.peer_listen_port,
+                [&peer](const bmc::http::Request& request, const std::string& source) { return peer->handle(request, source); },
+                bmc::ReadOnlyServer::Rejection{}, settings.peer_certificate, settings.peer_key);
+            peer_network->role("peer");
+            std::string error;
+            if (!peer_network->start(error)) throw std::runtime_error(error);
+            peer->start();
+        } catch (const std::exception& error) {
+            peer_started = false;
+            if (peer_network) peer_network->stop();
+            if (peer) peer->stop();
+            std::cerr << "bmc-lite: peer unavailable: " << error.what() << '\n';
+        }
+    }
+    bmc::ReadOnlyServer network(settings.http_bind, settings.http_port, [&sel] {
+        std::vector<bmc::SelEntry> entries;
+        for (const auto& record : sel.query(4096)) entries.push_back({
+            static_cast<std::int64_t>(record.id), record.time_ms, record.source, record.state, record.message, record.value});
+        return entries;
+    }, [&sample_count] { return sample_count.load(); });
+    network.extra_metrics([&] {
+        auto result = network.metrics();
+        if (control_network) result += control_network->metrics();
+        if (control) result += control->metrics();
+        if (uplink) result += uplink->metrics();
+        if (peer) result += peer->metrics();
+        if (peer_network) result += peer_network->metrics();
+        return result;
+    });
+    std::string network_error;
+    const bool network_started = network.start(network_error);
+    if (!network_started) {
+        logger.action("network", "listener unavailable: " + network_error);
+        std::cerr << "bmc-lite: HTTP unavailable: " << network_error << '\n';
+    }
     bmc::Fd poller(::epoll_create1(EPOLL_CLOEXEC));
     if (poller.get() < 0) {
         fail("epoll_create1");
@@ -96,6 +207,8 @@ int run(const bmc::CliOptions& settings) {
         add(poller.get(), gpio.get(), EPOLLPRI | EPOLLERR);
     }
     logger.action("service", "started");
+    bus.publish({bmc::BusEventType::service, "service", "started", std::nullopt});
+    logger.flush();
     std::array<epoll_event, 8> events {};
     unsigned completed = 0;
     bool stopping = false;
@@ -124,6 +237,7 @@ int run(const bmc::CliOptions& settings) {
                         // 先把两份新配置都校验完，再改动任何状态，保证重载是原子的：
                         // 失败时旧传感器与旧规则都原样保留。
                         bmc::FaultRuleEngine::validate(replacement_rules);
+                        if (replacement_rules.empty()) logger.action("configuration", "no recovery rules configured; threshold monitoring remains active");
                         std::vector<std::string> sensor_ids;
                         sensor_ids.reserve(replacement.size());
                         for (const auto& sensor : replacement) {
@@ -137,10 +251,14 @@ int run(const bmc::CliOptions& settings) {
                         // 避免每次 reload 都把已激活规则复位并重复触发一次恢复动作。
                         rules.merge(std::move(replacement_rules), sensor_ids);
                         ++config_generation;
+                        configure_control();
+                        if (peer) peer->generation(config_generation);
+                        logger.flush();
                     } catch (const std::exception& error) {
                         const auto message = std::string("reload rejected; keeping generation ") + std::to_string(config_generation) + ": " + error.what();
                         logger.action("configuration", message);
                         bus.publish({bmc::BusEventType::configuration, "configuration", message, std::nullopt});
+                        logger.flush();
                     }
                 } else {
                     stopping = true;
@@ -152,7 +270,10 @@ int run(const bmc::CliOptions& settings) {
                     fail("read timer");
                 }
                 monitor.poll(sensors, logger, worker, bus, rules, recovery, sel, worker_failed);
+                logger.flush();
+                monitor.report_log_degradation(logger, bus, sel);
                 ++completed;
+                ++sample_count;
                 stopping = settings.ticks != 0 && completed >= settings.ticks;
                 if (expirations > 1) {
                     logger.action("service", "missed timer ticks: " + std::to_string(expirations - 1));
@@ -167,9 +288,20 @@ int run(const bmc::CliOptions& settings) {
         }
     }
     // 排空恢复任务，再排空异步事件，最后才能销毁持久化与日志对象。
+    network.stop();
+    if (peer_network) peer_network->stop();
+    if (peer) peer->stop();
+    if (control_network) control_network->stop();
     worker.stop();
+    bus.publish({bmc::BusEventType::service, "service", "stopping", std::nullopt});
     bus.stop();
+    if (uplink) {
+        uplink->stop();
+        const auto state = uplink->stats();
+        logger.action("uplink", "sent=" + std::to_string(state.sent) + " dropped=" + std::to_string(state.dropped));
+    }
     const auto task_stats = worker.stats();
+    if (task_stats.failed) sel.append("scheduler", "failed", "worker failed tasks=" + std::to_string(task_stats.failed), std::nullopt, true);
     logger.action("scheduler", "accepted=" + std::to_string(task_stats.accepted) +
         " completed=" + std::to_string(task_stats.completed) +
         " failed=" + std::to_string(task_stats.failed) +
@@ -189,7 +321,9 @@ int run(const bmc::CliOptions& settings) {
         throw std::runtime_error("recovery worker could not write audit log");
     }
     logger.action("service", "stopped");
-    return 0;
+    if (!log_flushed) std::cerr << "bmc-lite: log flush failed; monitoring ran with degraded logging\n";
+    return log_flushed && network_started && control_started && peer_started && !network.failed() &&
+        (!control_network || !control_network->failed()) && (!peer_network || !peer_network->failed()) ? 0 : 1;
 }
 }
 int main(int count, char** arguments) {

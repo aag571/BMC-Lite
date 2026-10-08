@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DBMC_SANITIZE=OFF -DBMC_TSAN=OFF -DBMC_TLS="${BMC_TLS:-OFF}" "$@"
 cmake --build build-release --parallel 2
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT

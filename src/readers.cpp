@@ -207,8 +207,8 @@ public:
         std::strncpy(request.consumer, "bmc-lite", sizeof(request.consumer) - 1);
         if (io_.ioctl(chip.get(), GPIO_V2_GET_LINE_IOCTL, &request) < 0) system_failure("request GPIO v2 input");
         line_ = Fd(request.fd);
-        // 注意：GPIO_V2_GET_LINE_IOCTL 返回的描述符由内核分配，FakeLinuxIo 无法提供真实 fd，
-        // 因此这一句仍是真实系统调用；GPIO 的完整生命周期（含 line fd）需要实机或 QEMU 验证。
+        // line fd 由 RAII 管理。Fake 可返回自己打开的普通 fd，并脚本化后续 ioctl；
+        // 因此关闭与 CLOEXEC 也可测试，电气行为仍需实际 GPIO 设备验证。
         if (::fcntl(line_.get(), F_SETFD, FD_CLOEXEC) < 0) system_failure("set GPIO close-on-exec");
     }
     std::optional<double> read() override {

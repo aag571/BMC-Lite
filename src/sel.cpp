@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -90,7 +91,8 @@ SelStore::SelStore(std::filesystem::path path, std::size_t max_records, Truncate
     }
     std::lock_guard lock(mutex_);
     open();
-    replay();
+    try { replay(); }
+    catch (...) { ::close(descriptor_); descriptor_ = -1; throw; }
 }
 
 SelStore::~SelStore() {
@@ -190,21 +192,32 @@ void SelStore::trim() {
     if (!std::filesystem::is_regular_file(path_, status) || status) {
         return;
     }
-    const auto temporary = std::filesystem::path(path_.string() + ".compact");
-    {
-        const int output = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    auto temporary = path_.string() + ".compact.XXXXXX";
+    const int output = ::mkstemp(temporary.data());
+    try {
         if (output < 0) {
             throw std::system_error(errno, std::generic_category(), "open sel compaction");
         }
+        if (::fcntl(output, F_SETFD, FD_CLOEXEC) < 0 || ::fcntl(output, F_SETFL, O_APPEND) < 0 || ::fchmod(output, 0644) < 0)
+            throw std::system_error(errno, std::generic_category(), "configure sel compaction");
         for (const auto& record : records_) {
             write_all(output, encode(record));
         }
-        ::fsync(output);
-        ::close(output);
+        if (::fsync(output) < 0) { ++sync_failures_; throw std::system_error(errno, std::generic_category(), "sync sel compaction"); }
+        if (::rename(temporary.c_str(), path_.c_str()) < 0)
+            throw std::system_error(errno, std::generic_category(), "replace sel");
+    } catch (...) {
+        if (output >= 0) ::close(output);
+        ::unlink(temporary.c_str());
+        throw;
     }
-    if (::rename(temporary.c_str(), path_.c_str()) < 0) {
-        throw std::system_error(errno, std::generic_category(), "replace sel");
-    }
+    // rename 不会更新已打开的 fd；直接接管新文件，避免后续写入已被删除的旧 inode。
+    ::close(descriptor_); descriptor_ = output;
+    // 快照包含所有内存记录，包括原缓冲区和本次追加，不能再次追加这些行。
+    pending_.clear();
+    const auto parent = path_.parent_path().empty() ? std::filesystem::path(".") : path_.parent_path();
+    Fd directory(::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (directory.get() < 0 || ::fsync(directory.get()) < 0) ++sync_failures_;
 }
 
 void SelStore::drop_oldest(std::size_t count) {
@@ -219,14 +232,13 @@ bool SelStore::drain(bool sync) {
     if (pending_.empty()) {
         return true;
     }
-    try {
-        write_all(descriptor_, pending_);
-    } catch (const std::exception&) {
-        // 只有写入本身失败才算数据丢失；此时保留缓冲区等待下次重试。
-        ++write_failures_;
-        return false;
+    while (!pending_.empty()) {
+        const auto written = ::write(descriptor_, pending_.data(), pending_.size());
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) { ++write_failures_; return false; }
+        // 短写后只保留尚未写出的后缀，重试不能把已写出的半条记录再写一次。
+        pending_.erase(0, static_cast<std::size_t>(written));
     }
-    pending_.clear();
     if (sync && syncable_ && ::fdatasync(descriptor_) < 0) {
         // 同步失败不等于数据丢失（可能只是该文件系统不支持），因此单独计数。
         ++sync_failures_;
@@ -241,11 +253,14 @@ std::uint64_t SelStore::append(const std::string& source, const std::string& sta
     const auto time = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     records_.push_back({id, time, source, state, message, value});
-    if (records_.size() > max_records_) {
-        trim();
-    }
     if (policy_ != Truncate::prepare) {
         pending_ += encode(SelRecord{id, time, source, state, message, value});
+    }
+    if (records_.size() > max_records_) {
+        try { trim(); }
+        catch (const std::exception&) { ++write_failures_; }
+    }
+    if (policy_ != Truncate::prepare) {
         if (important || pending_.size() >= batch_bytes_) {
             drain(true);
         }

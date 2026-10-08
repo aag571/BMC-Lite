@@ -1,5 +1,7 @@
 #pragma once
 #include <cerrno>
+#include <atomic>
+#include <poll.h>
 #include <cstdint>
 #include <string>
 #include <sys/socket.h>
@@ -17,6 +19,16 @@ public:
     virtual int bind(int descriptor, const sockaddr* address, socklen_t length) = 0;
     virtual int listen(int descriptor, int backlog) = 0;
     virtual int accept(int descriptor, sockaddr* address, socklen_t* length) = 0;
+    virtual int connect(int descriptor, const sockaddr* address, socklen_t length) {
+        const int result = ::connect(descriptor, address, length);
+        last_error = result < 0 ? errno : 0;
+        return result;
+    }
+    // 零超时检查连接完成；Fake 可替换结果，不需要打开真实端口。
+    virtual int writable(int descriptor) {
+        pollfd event{descriptor, POLLOUT, 0};
+        return ::poll(&event, 1, 0);
+    }
     virtual int setsockopt(int descriptor, int level, int name, const void* value, socklen_t length) = 0;
     virtual int getsockopt(int descriptor, int level, int name, void* value, socklen_t* length) = 0;
     virtual ssize_t recv(int descriptor, void* buffer, std::size_t count, int flags) = 0;
@@ -28,7 +40,8 @@ public:
         last_error = result < 0 ? errno : 0;
         return result;
     }
-    int last_error = 0;
+    // 只读与控制各有网络线程，默认实例共享，诊断计数也必须避免数据竞争。
+    std::atomic<int> last_error{0};
 };
 
 class PosixSocketIo final : public SocketIo {

@@ -20,11 +20,12 @@ run_case() {
   local log="$workdir/$label.strace"
   local out="$workdir/$label.out"
   if command -v strace >/dev/null 2>&1; then
-    strace -f -c -o "$log" "$binary" --dir "$workdir/$label" --records "$records" "$@" >"$out" 2>"$workdir/$label.err" || {
+    strace -f -e trace=write,fdatasync -c -o "$log" "$binary" --dir "$workdir/$label" --records "$records" "$@" >"$out" 2>"$workdir/$label.err" || {
       echo "FAILED: $label" >&2; cat "$workdir/$label.err" >&2; return 1; }
     local writes fdatasyncs
-    writes=$(awk '/^[[:space:]]*[0-9]+[[:space:]]+write$/ {print $1}' "$log")
-    fdatasyncs=$(awk '/^[[:space:]]*[0-9]+[[:space:]]+fdatasync$/ {print $1}' "$log")
+    # strace -c 的第四列为调用次数，末列为 syscall 名。
+    writes=$(awk '$NF == "write" {print $4}' "$log")
+    fdatasyncs=$(awk '$NF == "fdatasync" {print $4}' "$log")
     printf '%-26s writes=%-8s fdatasync=%-8s %s\n' \
       "$label" "${writes:-0}" "${fdatasyncs:-0}" "$(tr '\n' ' ' <"$out")"
   else

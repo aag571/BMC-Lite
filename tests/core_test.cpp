@@ -5,7 +5,7 @@
 #include "bmc/http.hpp"
 #include "bmc/service.hpp"
 #include "bmc/socket_io.hpp"
-#include "tests/service_vectors.hpp"
+#include "service_vectors.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -143,9 +143,9 @@ public:
         } else if (request == GPIO_V2_GET_LINE_IOCTL) {
             auto* line_request = static_cast<gpio_v2_line_request*>(argument);
             line_requests.push_back(line_request->config.flags);
-            // 内核分配的 line 描述符无法伪造：置为 -1，让 reader 里随后的 ::fcntl 以 EBADF 失败。
-            // 因此 GPIO 的覆盖范围止于"请求参数构造"，line fd 的生命周期仍需实机或 QEMU 验证。
-            line_request->fd = -1;
+            line_descriptor = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+            descriptors[line_descriptor].replies[GPIO_V2_LINE_GET_VALUES_IOCTL] = {1};
+            line_request->fd = line_descriptor;
         } else if (request == GPIO_V2_LINE_GET_VALUES_IOCTL) {
             const auto bits = entry.replies.find(request);
             static_cast<gpio_v2_line_values*>(argument)->bits =
@@ -179,6 +179,7 @@ public:
     int selected_slaves = 0;
     int smbus_writes = 0;
     int next_descriptor = 101;
+    int line_descriptor = -1;
 };
 TEST(Engine, DebouncesCriticalAndUsesInclusiveBoundary) {
     bmc::Engine engine(policy());
@@ -473,7 +474,7 @@ TEST(ChipAdm1275, AppliesTwelveBitMaskAndHalfCodeOffset) {
     FakeLinuxIo fake;
     expect_chip_bus(fake);
     // READ_VIN 0x88：高 4 位保留，取 bit11:0；0x1234 & 0x0FFF = 0x234 = 564。
-    fake.descriptors[101].replies[0x88] = smbus_word_bytes(0x1234);
+    fake.descriptors[101].replies[I2C_SMBUS] = smbus_word_bytes(0x1234);
     auto bus = make_bus(fake);
     auto driver = bmc::make_chip("adm1275", *bus, "");
     const auto voltage = driver->read("vin");
@@ -481,7 +482,7 @@ TEST(ChipAdm1275, AppliesTwelveBitMaskAndHalfCodeOffset) {
     // 默认 0-20 V 量程的 LSB 为 5.208 mV，且电压采用 code + 0.5 偏移。
     EXPECT_NEAR(*voltage, 5.208e-3 * 564.5, 1e-9);
     // 未配置分流电阻时无法给出电流的安培值。
-    fake.descriptors[101].replies[0x8C] = smbus_word_bytes(0x0800);
+    fake.descriptors[101].replies[I2C_SMBUS] = smbus_word_bytes(0x0800);
     EXPECT_FALSE(driver->read("iout"));
     // 该芯片没有功率与温度命令。
     EXPECT_FALSE(driver->read("power"));
@@ -631,7 +632,7 @@ TEST(FakeIo, I2cReaderPropagatesOpenAndCapabilityFailures) {
     EXPECT_THROW(bmc::make_reader(config, fake), std::system_error);
     FakeLinuxIo incapable;
     incapable.descriptors[101].replies[I2C_SLAVE] = {0};
-    incapable.descriptors[101].replies[I2C_FUNCS] = {0, 0, 0, 0, 0, 0, 0, 0};
+    incapable.i2c_functions = 0;
     config.path = "/dev/fake-i2c,0x48,0x00";
     EXPECT_THROW(bmc::make_reader(config, incapable), std::runtime_error);
 }
@@ -659,6 +660,24 @@ TEST(FakeIo, I2cReaderDecodesWordAndScalesIt) {
     EXPECT_EQ(fake.selected_slaves, 1);
     EXPECT_EQ(fake.opened.size(), 1u);
     EXPECT_EQ(fake.opened[0], "/dev/fake-i2c");
+}
+TEST(FakeIo, GpioLineValuesFailureAndDescriptorLifetime) {
+    FakeLinuxIo fake;
+    auto config = policy(); config.backend = "gpio"; config.path = "/dev/fake-gpiochip,1,active-low";
+    config.scale = 2;
+    auto reader = bmc::make_reader(config, fake);
+    ASSERT_GE(fake.line_descriptor, 0);
+    EXPECT_NE(::fcntl(fake.line_descriptor, F_GETFD) & FD_CLOEXEC, 0);
+    ASSERT_EQ(fake.line_requests.size(), 1u);
+    EXPECT_NE(fake.line_requests[0] & GPIO_V2_LINE_FLAG_ACTIVE_LOW, 0u);
+    EXPECT_EQ(reader->read(), 2);
+    fake.descriptors[fake.line_descriptor].replies[GPIO_V2_LINE_GET_VALUES_IOCTL] = {0};
+    EXPECT_EQ(reader->read(), 0);
+    fake.descriptors.erase(fake.line_descriptor);
+    EXPECT_FALSE(reader->read());
+    const auto descriptor = fake.line_descriptor;
+    reader.reset(); errno = 0;
+    EXPECT_EQ(::fcntl(descriptor, F_GETFD), -1); EXPECT_EQ(errno, EBADF);
 }
 TEST(FakeIo, GpioReaderRejectsOffsetOutsideChipBeforeRequestingTheLine) {
     FakeLinuxIo fake;
@@ -758,6 +777,22 @@ TEST(Recovery, RejectsInvalidPolicy) {
     EXPECT_THROW(bmc::RecoveryPolicyEngine(nullptr), std::invalid_argument);
     EXPECT_THROW(bmc::RecoveryPolicyEngine([](const bmc::RecoveryRequest&) { return true; }, std::chrono::seconds(1), 0), std::invalid_argument);
 }
+TEST(Recovery, DisappearingSensorsHaveBoundedCooldownState) {
+    bmc::RecoveryPolicyEngine recovery([](const auto&) { return true; }, std::chrono::milliseconds(0), 1);
+    for (unsigned index = 0; index < 10000; ++index) {
+        const auto result = recovery.submit({"rule", "sensor-" + std::to_string(index), "inspect_device", index});
+        ASSERT_TRUE(result && result->success);
+        EXPECT_LE(recovery.runtime_size(), 4096u);
+    }
+}
+TEST(Recovery, StateCapacityPreservesExistingCooldowns) {
+    bmc::RecoveryPolicyEngine recovery([](const auto&) { return true; }, std::chrono::hours(1), 1);
+    for (unsigned index = 0; index < 4096; ++index)
+        ASSERT_TRUE(recovery.submit({"rule", "sensor-" + std::to_string(index), "inspect_device", index})->success);
+    EXPECT_EQ(recovery.runtime_size(), 4096u);
+    EXPECT_EQ(recovery.submit({"rule", "extra", "inspect_device", 0})->detail, "state capacity");
+    EXPECT_EQ(recovery.submit({"rule", "sensor-0", "inspect_device", 0})->detail, "cooldown");
+}
 TEST(Sel, PersistsSequencesAndLimitsRecords) {
     const auto path = temporary("-sel.db");
     { bmc::SelStore store(path, 2); EXPECT_EQ(store.append("cpu", "critical", "hot", 95), 1u); EXPECT_EQ(store.append("cpu", "normal", "clear"), 2u); EXPECT_EQ(store.append("fan", "failed", "stalled"), 3u); EXPECT_EQ(store.query().size(), 2u); }
@@ -765,6 +800,26 @@ TEST(Sel, PersistsSequencesAndLimitsRecords) {
     ASSERT_EQ(restored.query().size(), 2u);
     EXPECT_EQ(restored.query()[0].id, 2u);
     EXPECT_EQ(restored.next_id(), 4u);
+    std::filesystem::remove(path);
+}
+TEST(Sel, AppendsAfterRepeatedCompactionPersistExactlyOnce) {
+    const auto path = temporary("-sel-compact-reopen.db");
+    {
+        bmc::SelStore store(path, 3);
+        for (unsigned index = 0; index < 20; ++index) {
+            store.append("cpu", "normal", "sample-" + std::to_string(index), std::nullopt, true);
+            ASSERT_TRUE(store.flush());
+            bmc::SelStore reader(path, 3);
+            const auto records = reader.query();
+            ASSERT_EQ(records.size(), std::min<std::size_t>(index + 1, 3));
+            EXPECT_EQ(records.back().id, index + 1);
+            EXPECT_EQ(reader.next_id(), index + 2);
+        }
+    }
+    std::ifstream input(path);
+    std::string line; unsigned count = 0;
+    while (std::getline(input, line)) ++count;
+    EXPECT_EQ(count, 3u);
     std::filesystem::remove(path);
 }
 TEST(Sel, BatchesWritesAndFlushIsMeaningful) {
@@ -818,7 +873,8 @@ TEST(Sel, TruncatesTornTailOnStartupAndReportsIt) {
     // 截断后文件可以继续正常追加，并且不会破坏已有记录。
     store.append("fan", "failed", "stalled", std::nullopt, true);
     EXPECT_TRUE(store.flush());
-    EXPECT_EQ(store.truncated_bytes(), before - 42u);    bmc::SelStore reopened(path);
+    EXPECT_EQ(store.truncated_bytes(), std::string("2 2000 \"cpu\" \"normal\" \"partial").size());
+    bmc::SelStore reopened(path);
     ASSERT_EQ(reopened.query().size(), 2u);
     EXPECT_EQ(reopened.query()[1].source, "fan");
     EXPECT_EQ(reopened.next_id(), 3u);
@@ -1392,7 +1448,9 @@ TEST(SocketIo, PosixImplementationMatchesSystemCalls) {
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     EXPECT_EQ(io.bind(descriptor, reinterpret_cast<const sockaddr*>(&address), sizeof(address)), 0);
     // 不支持的 option 应返回 -1 并留下 errno。
-    EXPECT_EQ(io.getsockopt(descriptor, SOL_SOCKET, SO_TYPE, &address, nullptr), -1);
+    int option = 0;
+    socklen_t length = sizeof(option);
+    EXPECT_EQ(io.getsockopt(descriptor, SOL_SOCKET, -1, &option, &length), -1);
     EXPECT_NE(io.last_error, 0);
     EXPECT_EQ(io.close(descriptor), 0);
 }
@@ -1405,7 +1463,7 @@ TEST(SocketIo, PeerNameFormatsIpv4AndRejectsOthers) {
     EXPECT_EQ(bmc::peer_name(reinterpret_cast<const sockaddr*>(&ipv4), sizeof(ipv4)), "10.0.0.1:8080");
     // 长度不足或族不支持时返回空串，而不是读越界。
     // 长度不足以容纳 sockaddr_in 时返回空串，而不是读越界。
-    EXPECT_EQ(bmc::peer_name(reinterpret_cast<const sockaddr*>(&ipv4), sizeof(sockaddr)), "");
+    EXPECT_EQ(bmc::peer_name(reinterpret_cast<const sockaddr*>(&ipv4), sizeof(ipv4) - 1), "");
     EXPECT_EQ(bmc::peer_name(nullptr, 0), "");
     sockaddr_un unsupported {};
     unsupported.sun_family = AF_UNIX;
@@ -1499,7 +1557,7 @@ TEST(HttpParser, HandlesBodySplitAcrossArbitraryChunks) {
     bmc::http::Parser parser;
     EXPECT_EQ(parser.feed("POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nab"),
               bmc::http::ParseResult::incomplete);
-    EXPECT_EQ(parser.buffered_bytes(), 3u);
+    EXPECT_EQ(parser.buffered_bytes(), 2u);
     EXPECT_EQ(parser.feed("cde"), bmc::http::ParseResult::complete);
     EXPECT_EQ(parser.request().body, "abcde");
     // 同一连接上的下一条请求：feed 返回 complete 后解析器自动丢弃多余字节，
@@ -1610,7 +1668,7 @@ TEST(HttpParser, IncompleteInputNeverReportsComplete) {
     // 一个只发一半头部就停下的慢客户端：解析器只能一直说"还要更多"。
     EXPECT_EQ(parser.feed("GET /redfish/v1/ HTTP/1.1\r\nHost: bmc"), bmc::http::ParseResult::incomplete);
     EXPECT_EQ(parser.feed("\r\nContent-Length: 4\r\n"), bmc::http::ParseResult::incomplete);
-    EXPECT_EQ(parser.buffered_bytes() > 0, true);
+    EXPECT_EQ(parser.buffered_bytes(), 0u);
     EXPECT_EQ(parser.feed(""), bmc::http::ParseResult::incomplete);
     EXPECT_EQ(parser.feed(nullptr, 0), bmc::http::ParseResult::incomplete);
 }

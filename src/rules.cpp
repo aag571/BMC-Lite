@@ -1,6 +1,7 @@
 #include "bmc/core.hpp"
 #include <algorithm>
 #include <set>
+#include <unordered_set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -48,6 +49,15 @@ FaultRuleEngine::FaultRuleEngine(std::vector<FaultRule> rules) : rules_(std::mov
     validate_rules(rules_);
 }
 void FaultRuleEngine::reset() { runtime_.clear(); }
+void FaultRuleEngine::retain_sensors(const std::vector<std::string>& sensors) {
+    const std::unordered_set<std::string> live(sensors.begin(), sensors.end());
+    for (auto current = runtime_.begin(); current != runtime_.end();) {
+        const auto separator = current->first.rfind('\n');
+        if (separator == std::string::npos || live.count(current->first.substr(separator + 1)) == 0)
+            current = runtime_.erase(current);
+        else ++current;
+    }
+}
 
 void FaultRuleEngine::validate(const std::vector<FaultRule>& rules) {
     validate_rules(rules);

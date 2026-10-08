@@ -154,6 +154,9 @@ public:
     // 已消失的传感器、被删除的规则、以及触发状态被改写的规则，其运行时状态一律丢弃，
     // 否则保留下来的 active 会对应到不同的判定条件上。
     void merge(std::vector<FaultRule> rules, const std::vector<std::string>& sensors);
+    // 每轮采样用当前传感器集合清理消失设备的状态；不清除仍在运行的确认计数。
+    void retain_sensors(const std::vector<std::string>& sensors);
+    std::size_t runtime_size() const { return runtime_.size(); }
 private:
     struct Runtime { unsigned bad = 0; unsigned good = 0; bool active = false; std::uint64_t sequence = 0; };
     std::vector<FaultRule> rules_;
@@ -229,6 +232,7 @@ public:
     RecoveryPolicyEngine(Executor executor, std::chrono::milliseconds cooldown = std::chrono::seconds(30), unsigned max_attempts = 3, std::size_t concurrency = 1);
     std::optional<RecoveryResult> submit(const RecoveryRequest& request);
     void reset(const std::string& sensor);
+    std::size_t runtime_size() const;
 private:
     struct State { std::chrono::steady_clock::time_point last; bool running = false; };
     Executor executor_;
@@ -236,7 +240,7 @@ private:
     unsigned max_attempts_;
     std::size_t concurrency_;
     std::size_t active_ = 0;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::unordered_map<std::string, State> states_;
 };
 class Engine {
@@ -266,6 +270,9 @@ public:
     virtual ~EventLogger() = default;
     virtual void write(const Event& event) = 0;
     virtual void action(const std::string& id, const std::string& result) = 0;
+    // 非持久日志实现默认没有 I/O 降级；Monitor 不需要识别具体 Logger 类型。
+    virtual std::uint64_t write_failures() const { return 0; }
+    virtual std::uint64_t dropped_bytes() const { return 0; }
 };
 // 日志写入策略。日志的故障证据价值高于采样末端的 SEL，但仍允许在崩溃时丢掉少量尾部行，
 // 因此默认批量合并写入与不 fsync，需要更强保证时可显式打开。
@@ -290,8 +297,8 @@ public:
     // 把未落盘缓冲区写入磁盘；缓冲区仍非空时返回 false。
     bool flush();
     std::size_t pending_bytes() const;
-    std::uint64_t write_failures() const;
-    std::uint64_t dropped_bytes() const;
+    std::uint64_t write_failures() const override;
+    std::uint64_t dropped_bytes() const override;
 private:
     void append(const std::string& line);
     bool rotate(std::size_t incoming);

@@ -16,6 +16,17 @@ struct CliOptions {
     unsigned task_capacity = 64;
     bool enable_actions = false;
     bool check_config = false;
+    unsigned http_port = 0;
+    std::string http_bind = "127.0.0.1";
+    bool http_allow_remote = false;
+    unsigned control_port = 0;
+    std::string control_bind = "127.0.0.1";
+    std::string control_token_file, control_certificate, control_key;
+    std::string uplink_address;
+    unsigned uplink_port = 0, uplink_capacity = 256;
+    std::string peer_address, peer_token_file, peer_ca, peer_server_name, peer_certificate, peer_key;
+    std::string peer_bind = "127.0.0.1";
+    unsigned peer_port = 0, peer_listen_port = 0, peer_interval_ms = 1000, peer_stale_ms = 5000;
     // --help 出现在任意位置都生效，并在解析出错时优先显示用法。
     bool help = false;
 };

@@ -54,6 +54,26 @@ void Monitor::poll(std::vector<MonitorSensor>& sensors, bmc::EventLogger& logger
         if (transition) std::cout << event.id << ": " << bmc::name(event.before) << " -> " << bmc::name(event.after) << '\n';
     }
     report_sel_degradation(logger, bus, sel);
+    std::vector<std::string> live;
+    live.reserve(sensors.size());
+    for (const auto& sensor : sensors) live.push_back(sensor.config.id);
+    rules.retain_sensors(live);
+    report_log_degradation(logger, bus, sel);
+}
+
+void Monitor::report_log_degradation(EventLogger& logger, EventBus& bus, SelStore& sel,
+    std::chrono::steady_clock::time_point now) {
+    const auto failures = logger.write_failures();
+    const auto dropped = logger.dropped_bytes();
+    if (failures == reported_log_failures_ && dropped == reported_log_dropped_) return;
+    if (log_reported_ && now - last_log_report_ < std::chrono::seconds(5)) return;
+    const auto message = "log-write-failures=" + std::to_string(failures) +
+        " dropped-bytes=" + std::to_string(dropped);
+    // 不向故障 Logger 写回告警，否则告警自身会增加失败计数形成反馈循环。
+    sel.append("log", "degraded", message, std::nullopt, true);
+    bus.publish({BusEventType::service, "log", message, std::nullopt});
+    reported_log_failures_ = failures; reported_log_dropped_ = dropped;
+    last_log_report_ = now; log_reported_ = true;
 }
 
 void Monitor::report_sel_degradation(EventLogger& logger, EventBus& bus, SelStore& sel) {

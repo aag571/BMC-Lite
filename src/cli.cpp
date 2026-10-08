@@ -32,7 +32,15 @@ bool split_assignment(const std::string& argument, std::string& name, std::strin
 std::string usage() {
     return "bmc-lite [--config FILE] [--rules FILE] [--sel FILE] [--log FILE] [--interval-ms N]\n"
            "         [--ticks N] [--gpio VALUE_NODE] [--worker-threads N] [--task-capacity N]\n"
-           "         [--enable-actions] [--check-config] [--help]\n";
+           "         [--enable-actions] [--check-config] [--http-port N] [--http-bind ADDR] [--help]\n"
+           "         [--http-allow-remote]\n"
+           "         [--control-port N --control-token-file FILE] [--control-bind ADDR]\n"
+           "         [--control-tls-cert FILE --control-tls-key FILE]\n"
+           "         [--uplink-address IPv4 --uplink-port N] [--uplink-capacity N]\n"
+           "         [--peer-address IPv4 --peer-port N --peer-listen-port N --peer-token-file FILE]\n"
+           "         [--peer-bind IPv4] [--peer-interval-ms N] [--peer-stale-ms N]\n"
+           "         [--peer-ca FILE --peer-server-name NAME --peer-tls-cert FILE --peer-tls-key FILE]\n"
+           "HTTP is disabled by default; --http-port enables the read-only listener.\n";
 }
 
 CliOptions parse_options(const std::vector<std::string>& arguments) {
@@ -53,6 +61,10 @@ CliOptions parse_options(const std::vector<std::string>& arguments) {
         }
         if (argument == "--check-config") {
             result.check_config = true;
+            continue;
+        }
+        if (argument == "--http-allow-remote") {
+            result.http_allow_remote = true;
             continue;
         }
         std::string name = argument;
@@ -83,6 +95,43 @@ CliOptions parse_options(const std::vector<std::string>& arguments) {
             result.worker_threads = positive(value, name);
         } else if (name == "--task-capacity") {
             result.task_capacity = positive(value, name);
+        } else if (name == "--http-port") {
+            result.http_port = positive(value, name);
+            if (result.http_port > 65535) throw std::invalid_argument("--http-port must be in 1..65535");
+        } else if (name == "--http-bind") {
+            result.http_bind = value;
+        } else if (name == "--control-port") {
+            result.control_port = positive(value, name);
+            if (result.control_port > 65535) throw std::invalid_argument("--control-port must be in 1..65535");
+        } else if (name == "--control-bind") {
+            result.control_bind = value;
+        } else if (name == "--control-token-file") {
+            result.control_token_file = value;
+        } else if (name == "--control-tls-cert") {
+            result.control_certificate = value;
+        } else if (name == "--control-tls-key") {
+            result.control_key = value;
+        } else if (name == "--uplink-address") {
+            result.uplink_address = value;
+        } else if (name == "--uplink-port") {
+            result.uplink_port = positive(value, name);
+            if (result.uplink_port > 65535) throw std::invalid_argument("--uplink-port must be in 1..65535");
+        } else if (name == "--uplink-capacity") {
+            result.uplink_capacity = positive(value, name);
+            if (result.uplink_capacity > 4096) throw std::invalid_argument("--uplink-capacity must be in 1..4096");
+        } else if (name == "--peer-address") { result.peer_address = value;
+        } else if (name == "--peer-bind") { result.peer_bind = value;
+        } else if (name == "--peer-token-file") { result.peer_token_file = value;
+        } else if (name == "--peer-ca") { result.peer_ca = value;
+        } else if (name == "--peer-server-name") { result.peer_server_name = value;
+        } else if (name == "--peer-tls-cert") { result.peer_certificate = value;
+        } else if (name == "--peer-tls-key") { result.peer_key = value;
+        } else if (name == "--peer-port" || name == "--peer-listen-port") {
+            const auto port = positive(value, name);
+            if (port > 65535) throw std::invalid_argument(name + " must be in 1..65535");
+            if (name == "--peer-port") result.peer_port = port; else result.peer_listen_port = port;
+        } else if (name == "--peer-interval-ms") { result.peer_interval_ms = positive(value, name);
+        } else if (name == "--peer-stale-ms") { result.peer_stale_ms = positive(value, name);
         } else if (name.rfind("--", 0) == 0) {
             throw std::invalid_argument("unknown option: " + name);
         } else {
@@ -90,6 +139,17 @@ CliOptions parse_options(const std::vector<std::string>& arguments) {
             throw std::invalid_argument("unexpected argument: " + argument);
         }
     }
+    if (result.http_port != 0 && result.http_bind.rfind("127.", 0) != 0 && !result.http_allow_remote)
+        throw std::invalid_argument("non-loopback HTTP requires --http-allow-remote");
+    if (result.uplink_address.empty() != (result.uplink_port == 0))
+        throw std::invalid_argument("uplink requires address and port together");
+    const bool peer = !result.peer_address.empty() || result.peer_port || result.peer_listen_port ||
+        !result.peer_token_file.empty() || !result.peer_ca.empty() || !result.peer_server_name.empty() ||
+        !result.peer_certificate.empty() || !result.peer_key.empty();
+    if (peer && (result.peer_address.empty() || !result.peer_port || !result.peer_listen_port || result.peer_token_file.empty()))
+        throw std::invalid_argument("peer requires address, port, listen-port and token-file together");
+    if (peer && (result.peer_interval_ms < 10 || result.peer_stale_ms <= result.peer_interval_ms))
+        throw std::invalid_argument("peer interval must be >=10 ms and stale timeout must exceed interval");
     return result;
 }
 }

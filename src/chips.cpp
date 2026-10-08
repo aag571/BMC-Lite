@@ -146,7 +146,7 @@ private:
 };
 
 // ---------------- ADM1275 热插拔控制器（PMBus，DIRECT 格式） ----------------
-// 该芯片只有 31 条命令：没有 READ_PIN，也没有温度命令，因此只提供 vin/vout/iout。
+// 当前只提供 vin/vout/iout；“31 条命令、无 READ_PIN/温度命令”未核实到 Rev.E 具体表项。
 // READ_VIN 0x88 / READ_VOUT 0x8B / READ_IOUT 0x8C，数据右对齐在 bit[11:0]，无符号。
 class Adm1275Driver final : public ChipDriver {
 public:
@@ -198,9 +198,11 @@ private:
 };
 
 // ---------------- EMC2103 风扇控制器（SMSC，固定从地址 0x2E） ----------------
+// 未核实：以下换算常量、0x8000 故障码、内部分辨率与默认 RANGE 尚未对照 DS20006705 发布版。
+// 本实现及 Fake 测试只能证明当前假设的一致性，不能代替真实芯片数据手册核验。
 // 转速：0x4E 高字节 / 0x4F 低字节，13 位左对齐（低 3 位恒为 0）。
 //   COUNT = (hi << 5) | (lo >> 3)，RPM = 3932160 / (COUNT × m)，
-//   常量 3932160 = 60 × 32768 / 5（2 极扇、5 边沿、32.768 kHz tach 时钟）。
+//   3932160 是当前实现的候选常量，时钟/边沿推导未核实，不声称与发布版一致。
 //   m 由 RANGE[1:0] 决定，本实现取默认量程 1000 RPM 的 m = 2。
 //   COUNT == 0x1FE0 是"风扇停转/未接"哨兵值（寄存器默认值），不是转速。
 // 温度：每通道 16 位有符号、0.125 ℃ 分辨率，C = (int16)((hi << 8) | lo) / 256。
@@ -254,6 +256,7 @@ private:
     static constexpr std::uint8_t kExternalLow = 0x03;
     static constexpr std::uint8_t kTachHigh = 0x4E;
     static constexpr std::uint8_t kTachLow = 0x4F;
+    // 未核实到发布版；保留当前兼容行为，避免没有依据地改动寄存器换算。
     static constexpr std::uint16_t kDiodeFault = 0x8000;
     static constexpr double kTachConstant = 3932160.0;
     static constexpr double kRangeMultiplier = 2.0;

@@ -34,7 +34,7 @@
 
 Action 用于选择 LogOnlyAction 或 PwmAction；EventLogger 是监控逻辑的日志接口，Logger 为文件实现。测试可自定义记录型日志实现。Reader/Device 隔离采集业务；底层 open/ioctl/read/write/close 已经收敛到 `LinuxIo`（`include/bmc/linux_io.hpp`），由应用层注入 `PosixLinuxIo`，测试注入 `tests/core_test.cpp` 里的 `FakeLinuxIo`。因此 I2C 的地址/寄存器校验、SMBus word 解码、能力位拒绝、以及 PWM 写入失败路径都有单元测试覆盖。
 
-GPIO 仍是部分覆盖：`GPIO_V2_GET_LINE_IOCTL` 由内核分配 line 描述符，假实现无法提供，因此 GPIO 只覆盖"请求参数构造"（offset 越界、active-low 标志、后续 fcntl 失败），line fd 的生命周期与实机电气行为仍需目标板或 QEMU 验证。系统调用接口之外的部分（epoll/timerfd/signalfd 调度）仍无单元测试，只能靠 `tests/runtime_test.py` 端到端覆盖。
+GPIO Fake 返回自己打开的真实占位 fd，脚本化线值 ioctl，覆盖 active-low 请求、读取失败、CLOEXEC 和销毁时关闭。电气行为仍需设备验证。epoll/timerfd/signalfd 的进程编排由 Linux 集成测试验证。
 
 ## 当前拆分边界
 

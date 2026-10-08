@@ -17,22 +17,6 @@ std::string timestamp() {
     const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     return std::to_string(milliseconds);
 }
-void write_all(int descriptor, const std::string& text) {
-    std::size_t offset = 0;
-    while (offset < text.size()) {
-        const auto written = ::write(descriptor, text.data() + offset, text.size() - offset);
-        if (written < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            throw std::system_error(errno, std::generic_category(), "write log");
-        }
-        if (written == 0) {
-            throw std::runtime_error("short log write");
-        }
-        offset += static_cast<std::size_t>(written);
-    }
-}
 }
 Logger::Logger(std::filesystem::path path, std::uintmax_t limit, unsigned keep, bool sync, std::size_t batch_bytes)
     : path_(std::move(path)), limit_(limit), keep_(keep), policy_{batch_bytes, sync, 1u << 20} {
@@ -57,7 +41,7 @@ Logger::~Logger() {
     }
 }
 void Logger::open() {
-    descriptor_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    descriptor_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NONBLOCK, 0644);
     if (descriptor_ < 0) {
         throw std::system_error(errno, std::generic_category(), "open log");
     }
@@ -69,14 +53,12 @@ bool Logger::drain(bool sync) {
     if (pending_.empty()) {
         return true;
     }
-    try {
-        write_all(descriptor_, pending_);
-    } catch (const std::exception&) {
-        // 写入失败时保留缓冲区等待重试，并计数。
-        ++write_failures_;
-        return false;
+    while (!pending_.empty()) {
+        const auto written = ::write(descriptor_, pending_.data(), pending_.size());
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) { ++write_failures_; return false; }
+        pending_.erase(0, static_cast<std::size_t>(written));
     }
-    pending_.clear();
     if (sync && ::fdatasync(descriptor_) < 0) {
         // 同步失败不表示写入失败，但仍记录失败次数以便观测。
         ++write_failures_;

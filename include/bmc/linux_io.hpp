@@ -1,5 +1,6 @@
 #pragma once
 #include <cerrno>
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <unistd.h>
@@ -21,7 +22,7 @@ public:
         last_error = result < 0 ? errno : 0;
         return result;
     }
-    int last_error = 0;
+    std::atomic<int> last_error{0};
 };
 class PosixLinuxIo final : public LinuxIo {
 public:

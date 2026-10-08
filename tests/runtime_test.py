@@ -27,7 +27,8 @@ def main():
         config.write_text("cpu mock 40 1 high 70 90 3 1 3 -\n")
         process = subprocess.Popen(
             [executable, "--config", str(config), "--log", str(log),
-             "--interval-ms", "10"],
+             "--interval-ms", "10", "--sel", str(root / "sel.db"),
+             "--rules", str(root / "no-rules")],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )

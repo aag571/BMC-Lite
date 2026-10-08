@@ -2,13 +2,21 @@
 
 [中文手册](README.md)
 
+The daemon includes optional read-only HTTP and control services, disabled by default. See the [control guide](docs/control.en.md) for TLS builds, release installation, credentials, systemd setup, requests and auditing.
+
+Optional uplink telemetry provides a bounded queue, nonblocking TCP, reconnection and metrics. See the [uplink deployment and protocol guide](docs/uplink.en.md).
+
+See [runtime reliability](docs/runtime-reliability.en.md) for logger degradation reporting, rule state cleanup and hardware verification limits.
+
+Authenticated peer heartbeats exchange configuration generations and report stale/recovered peers through a separate port. See the [peer guide](docs/peer.en.md) and [acceptance record](docs/completion.md).
+
 BMC-Lite is a Linux C++20 hardware monitoring resume project. The daemon samples devices, confirms fault states, evaluates rules, schedules recovery tasks, and writes JSONL logs and persistent events. A separate Python utility provides read-only HTTP resources and Prometheus metrics.
 
 ## 1. Choose your installation path
 
 Use **source installation** when developing or running tests. Use the **release archive** when deploying without a compiler. The prebuilt binary is Linux x86_64; its glibc and libstdc++ requirements depend on the build machine. Build from source if the target reports a missing GLIBC/GLIBCXX version. The current release is built on the development VM; Ubuntu 24.04 x86_64 is the recommended target.
 
-The target VM in this example is `192.168.124.128`. Replace `user` with your actual SSH account. GitHub URL and tag placeholders must be replaced with your published repository values; no GitHub release is assumed to exist.
+The target VM in this example is `192.168.124.128`. Replace `user` with your actual SSH account. Copy the delivered archive and checksum directly; no GitHub Release attachment is assumed to exist.
 
 ## 2. Prepare a fresh Ubuntu VM
 
@@ -18,13 +26,13 @@ Run these commands **inside the target VM**:
 uname -m
 cat /etc/os-release
 sudo apt-get update
-sudo apt-get install -y ca-certificates curl python3 tar libstdc++6
+sudo apt-get install -y ca-certificates curl python3 tar libstdc++6 libssl3t64 openssl
 ```
 
 For source builds, also install:
 
 ```sh
-sudo apt-get install -y git build-essential cmake
+sudo apt-get install -y git build-essential cmake libssl-dev
 g++ --version
 cmake --version
 ```
@@ -36,11 +44,10 @@ GCC 11+ and CMake 3.20+ are required. If you need SSH access, install `openssh-s
 ```sh
 mkdir -p ~/src
 cd ~/src
-git clone <GITHUB_REPOSITORY_URL> bmc-lite
+git clone https://github.com/aag571/BMC-Lite.git bmc-lite
 cd bmc-lite
 git fetch --tags
-# Optional: git checkout <RELEASE_TAG>
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DBMC_TLS=ON
 cmake --build build --parallel 2
 ctest --test-dir build --output-on-failure
 ```
@@ -64,7 +71,7 @@ Run C++ tests independently:
 ./build/bmc_stress
 ```
 
-`LinuxIo` (`include/bmc/linux_io.hpp`) is the single injection point for system calls. `PosixLinuxIo` forwards to the real `open`/`ioctl`/`read`/`write`/`close`, and the `FakeLinuxIo` defined in `tests/core_test.cpp` scripts ioctl replies and captures writes, so the I2C decode path and the PWM write path are covered without `/dev/i2c-*` or `/dev/gpiochip*`. Coverage stops short of the GPIO line descriptor: `GPIO_V2_GET_LINE_IOCTL` returns a kernel-assigned fd that a fake cannot provide, so GPIO tests assert request construction (offsets, flags, the `fcntl` failure) rather than a live line. `tests/linux_io_fake_test.py` is unrelated to `FakeLinuxIo` despite the similar name.
+`LinuxIo` is the injected syscall interface. C++ FakeLinuxIo covers I2C replies, PWM writes, GPIO values and failures. For GPIO it supplies an owned real placeholder descriptor, so CLOEXEC and closure are also tested. Electrical behavior requires hardware. Python `linux_io_fake_test.py` is unrelated to this C++ fake.
 
 ## 4. First foreground run
 
@@ -84,7 +91,7 @@ Expect warning, critical, unavailable, and recovery transitions. Exit code 0 ind
 ## 5. Source Release installation
 
 ```sh
-cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DBMC_TLS=ON
 cmake --build build-release --parallel 2
 ./build-release/bmc-lite --help
 sudo bash deploy/install.sh
@@ -100,7 +107,7 @@ Installation creates the service account, installs the daemon/configuration/mana
 On the build machine, from the project root:
 
 ```sh
-bash tools/package-release.sh
+BMC_TLS=ON bash tools/package-release.sh
 sha256sum -c bmc-lite-release.tar.gz.sha256
 tar -tzf bmc-lite-release.tar.gz | head
 scp bmc-lite-release.tar.gz bmc-lite-release.tar.gz.sha256 user@192.168.124.128:/tmp/
@@ -167,7 +174,24 @@ Do not assume that hwmon numbering is stable across boots. Generic I2C reads are
 
 ## 9. HTTP and metrics after installation
 
-The monitor systemd service does **not** automatically start the HTTP utility. In a second terminal:
+The default service does not listen. Enable the daemon HTTP server with `sudo systemctl edit bmc-lite.service`:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/opt/bmc-lite/bmc-lite --config /opt/bmc-lite/config/hardware.conf --rules /opt/bmc-lite/config/rules.conf --sel /var/log/bmc-lite/sel.db --log /var/log/bmc-lite/faults.jsonl --http-port 8000
+```
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart bmc-lite.service
+curl -f http://127.0.0.1:8000/healthz
+curl -f http://127.0.0.1:8000/metrics
+```
+
+Samples should increase. Daemon metrics add connections, rejection reasons, requests by role/method/status, bytes and enabled control/uplink/peer counters. Sensor values represent recorded events. Combine optional features in one ExecStart override. Remote control requires TLS; see the control guide for authentication, audit and configured PWM write permissions.
+
+Alternatively, the Python utility can serve a stored SEL in a second terminal. Choose a different port if daemon HTTP is enabled:
 
 ```sh
 sudo -u bmc-lite python3 /opt/bmc-lite/tools/bmc_manage.py \
@@ -189,7 +213,7 @@ ssh -N -L 18000:127.0.0.1:8000 user@192.168.124.128
 curl -f http://127.0.0.1:18000/metrics
 ```
 
-Metrics report recorded event state and value, not every live sensor sample. HTTP is loopback-only, with bounded concurrent handlers and connection timeout. It has no TLS/authentication and is not standard Redfish or IPMI.
+Python HTTP is loopback-only, has no TLS/authentication or daemon network metrics. Neither interface implements full standard Redfish or IPMI.
 
 ## 10. Controlled demonstration
 
@@ -203,7 +227,7 @@ ctest --test-dir build -R 'runtime_reload|fault_injection' --output-on-failure
 
 Back up the installed directory and stop the service through systemd before running the installer. The installer preserves configuration. Start the service, inspect journal output, and restore the backup if necessary. Never replace the executable while it is running.
 
-For `GLIBCXX` errors, compile on the target. For unavailable sensors, check device paths/permissions. For SEL access errors, run the utility as `bmc-lite` because its log directory is private. For refused HTTP connections, check that the separate utility is running. For inactive services, inspect `journalctl -u bmc-lite.service -b` and `systemctl cat bmc-lite.service`.
+For `GLIBCXX` errors, compile on the target. For unavailable sensors, check paths/permissions. For SEL access errors, use the service account. For refused HTTP connections, check the daemon port option or Python service. Inspect `journalctl -u bmc-lite.service -b` and `systemctl cat bmc-lite.service` for startup errors.
 
 ## 12. Validation and scope
 
@@ -213,6 +237,10 @@ bash tools/validate.sh sanitize
 bash tools/validate.sh stress
 sudo apt-get install -y valgrind
 bash tools/validate.sh valgrind
+bash tools/validate.sh tsan
+# If GCC TSan reports unexpected memory mapping and setarch is permitted:
+BMC_TSAN_NO_ASLR=1 bash tools/validate.sh tsan
+bash tools/bench-writes.sh 50000
 ```
 
 This is an educational resume project, not complete BMC firmware. SEL is a custom text format without CRC or power-loss atomicity guarantees: startup repairs a torn trailing record by truncating it and reports the discarded byte count, but a bit flip in the middle of the file is not detectable. Both the log and the SEL batch their writes through a persistent descriptor; neither terminates the daemon on a write failure. The log does not fsync by default (pass `sync = true` to the Logger constructor for per-record durability) and flushes its buffer into the current segment before rotating, while the SEL writes state transitions and recovery outcomes immediately with fdatasync. Real I2C/GPIO electrical behavior needs hardware or an appropriate QEMU model. Python OS descriptor tests are not mocked C++ ioctl tests. See `docs/code-guide.md` for the source reading order.

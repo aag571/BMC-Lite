@@ -5,15 +5,19 @@
 #include <unistd.h>
 
 namespace bmc {
-int PosixSocketIo::socket(int domain, int type, int protocol) { return ::socket(domain, type, protocol); }
+int PosixSocketIo::socket(int domain, int type, int protocol) { const int r = ::socket(domain, type, protocol); last_error = r < 0 ? errno : 0; return r; }
 int PosixSocketIo::bind(int descriptor, const sockaddr* address, socklen_t length) { return ::bind(descriptor, address, length); }
 int PosixSocketIo::listen(int descriptor, int backlog) { return ::listen(descriptor, backlog); }
-int PosixSocketIo::accept(int descriptor, sockaddr* address, socklen_t* length) { return ::accept(descriptor, address, length); }
+int PosixSocketIo::accept(int descriptor, sockaddr* address, socklen_t* length) {
+    const int result = ::accept4(descriptor, address, length, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    last_error = result < 0 ? errno : 0;
+    return result;
+}
 int PosixSocketIo::setsockopt(int descriptor, int level, int name, const void* value, socklen_t length) {
     return ::setsockopt(descriptor, level, name, value, length);
 }
 int PosixSocketIo::getsockopt(int descriptor, int level, int name, void* value, socklen_t* length) {
-    return ::getsockopt(descriptor, level, name, value, length);
+    const int r = ::getsockopt(descriptor, level, name, value, length); last_error = r < 0 ? errno : 0; return r;
 }
 ssize_t PosixSocketIo::recv(int descriptor, void* buffer, std::size_t count, int flags) {
     return ::recv(descriptor, buffer, count, flags);

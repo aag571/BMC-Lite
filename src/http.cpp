@@ -225,9 +225,15 @@ ParseResult Parser::progress() {
         }
 
         // 头部结束后立刻判定不支持的传输方式与重复 Content-Length。
-        if (request_.has_header("Transfer-Encoding")) {
+        if (request_.has_header("Transfer-Encoding") || request_.has_header("Expect") || request_.has_header("Upgrade")) {
             error_ = ParseResult::unsupported;
             return error_;
+        }
+        for (const auto* unique : {"Content-Length", "Authorization", "Host", "X-BMC-Generation"}) {
+            const auto count = std::count_if(request_.headers.begin(), request_.headers.end(), [unique](const auto& header) {
+                return lower(header.first) == lower(unique);
+            });
+            if (count > 1) { error_ = ParseResult::malformed; return error_; }
         }
         if (request_.has_header("Content-Length")) {
             const auto text = request_.header("Content-Length");
