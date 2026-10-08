@@ -773,6 +773,40 @@ TEST(Recovery, AppliesCooldownRetriesAndReset) {
     auto second = engine.submit({"r", "cpu", "increase_fan", 3});
     ASSERT_TRUE(second); EXPECT_TRUE(second->accepted);
 }
+TEST(Recovery, SeparateWorkerCanRunWhileAnotherActionWaits) {
+    bmc::Worker worker(4, 2);
+    std::promise<void> entered;
+    std::promise<void> release;
+    std::promise<void> completed;
+    auto release_signal = release.get_future().share();
+    auto completed_signal = completed.get_future();
+    bmc::RecoveryPolicyEngine recovery([&](const bmc::RecoveryRequest& request) {
+        if (request.sensor == "slow") {
+            entered.set_value();
+            release_signal.wait();
+        } else {
+            completed.set_value();
+        }
+        return true;
+    }, std::chrono::milliseconds(0), 1, 2);
+    ASSERT_TRUE(worker.submit([&] { recovery.submit({"rule", "slow", "inspect_device", 1}); }));
+    entered.get_future().wait();
+    ASSERT_TRUE(worker.submit([&] { recovery.submit({"rule", "fast", "inspect_device", 2}); }));
+    const auto status = completed_signal.wait_for(std::chrono::seconds(1));
+    release.set_value();
+    worker.stop();
+    EXPECT_EQ(status, std::future_status::ready);
+}
+TEST(Recovery, ManyFailuresKeepTotalBackoffBounded) {
+    bmc::RecoveryPolicyEngine recovery([](const bmc::RecoveryRequest&) { return false; },
+        std::chrono::milliseconds(0), 8, 1);
+    const auto started = std::chrono::steady_clock::now();
+    const auto result = recovery.submit({"rule", "cpu", "inspect_device", 1});
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->attempts, 8u);
+    EXPECT_LT(elapsed, std::chrono::milliseconds(900));
+}
 TEST(Recovery, RejectsInvalidPolicy) {
     EXPECT_THROW(bmc::RecoveryPolicyEngine(nullptr), std::invalid_argument);
     EXPECT_THROW(bmc::RecoveryPolicyEngine([](const bmc::RecoveryRequest&) { return true; }, std::chrono::seconds(1), 0), std::invalid_argument);
@@ -1245,7 +1279,7 @@ TEST(Cli, ParsesEveryValueOptionAndDefaults) {
     EXPECT_EQ(defaults.sel, "var/sel.db");
     EXPECT_EQ(defaults.log, "var/faults.jsonl");
     EXPECT_EQ(defaults.interval_ms, 1000u);
-    EXPECT_EQ(defaults.worker_threads, 1u);
+    EXPECT_EQ(defaults.worker_threads, 2u);
     EXPECT_EQ(defaults.task_capacity, 64u);
     EXPECT_EQ(defaults.ticks, 0u);
     EXPECT_TRUE(defaults.gpio.empty());

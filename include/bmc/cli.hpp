@@ -12,7 +12,7 @@ struct CliOptions {
     std::string gpio;
     unsigned interval_ms = 1000;
     unsigned ticks = 0;
-    unsigned worker_threads = 1;
+    unsigned worker_threads = 2;
     unsigned task_capacity = 64;
     bool enable_actions = false;
     bool check_config = false;

@@ -33,9 +33,16 @@ std::optional<RecoveryResult> RecoveryPolicyEngine::submit(const RecoveryRequest
     // 外部动作不能持有策略锁，否则其他传感器被一个慢设备阻塞。
     // 不跨解锁保存 unordered_map 元素引用，其他提交可能触发 rehash。
     bool success = false; unsigned attempts = 0;
+    auto remaining_backoff = std::chrono::milliseconds(30);
     for (; attempts < max_attempts_ && !success; ++attempts) {
         try { success = executor_(request); } catch (...) { success = false; }
-        if (!success && attempts + 1 < max_attempts_) std::this_thread::sleep_for(std::chrono::milliseconds(10 * (1u << std::min(attempts, 6u))));
+        if (!success && attempts + 1 < max_attempts_) {
+            // 即使调用方提高尝试次数，总退避也不超过 30ms，避免长期占用 Worker。
+            const auto delay = std::min(remaining_backoff,
+                std::chrono::milliseconds(10 * (1u << std::min(attempts, 6u))));
+            if (delay.count() > 0) std::this_thread::sleep_for(delay);
+            remaining_backoff -= delay;
+        }
     }
     lock.lock();
     --active_; states_[key].running = false; states_[key].last = std::chrono::steady_clock::now();
