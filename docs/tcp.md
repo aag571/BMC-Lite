@@ -1,20 +1,19 @@
 # TCP 组件设计
 
-本文记录 TCP 组件的设计依据。阶段 1–6 已落地，实际安装与验证见 completion.md、control.md、uplink.md、peer.md。
-下文“现状”表记录设计时的基线；daemon 现已提供默认关闭的独立只读、控制和心跳监听。
+本文记录 TCP 组件的设计依据。只读、控制与心跳三个监听已实现，安装与验证见 verification.md、control.md、uplink.md、peer.md。
 只读业务响应层继续与 Python 逐字对拍；daemon /metrics 在基础文本后追加运行中网络及已启用模块指标。
 
 ## 1. 现状与为什么不能只做一个端口
 
-已经存在的东西：
+作为设计起点的既有组件：
 
 | 组件 | 位置 | 能力 |
 |---|---|---|
-| 只读 HTTP 工具 | `tools/bmc_manage.py:97` | 监听 `127.0.0.1:8000`，`GET` 的 Redfish 形状资源 + `/metrics`，16 并发 + 32 排队 + 5 s 超时 |
+| 只读 HTTP 工具 | `tools/bmc_manage.py`（`serve()` 在 :153） | 监听 `127.0.0.1:8000`，`GET` 的 Redfish 形状资源 + `/metrics`，16 并发 + 32 排队 + 5 s 超时；该脚本同时是 C++ 响应层的对拍基准 |
 | 事件总线 | `src/event_bus.cpp` | 容量 256，`publish` 满时丢弃并 `dropped()` 计数 |
-| 单线程调度 | `src/main.cpp:103` | `epoll_wait` 最多 8 个事件、超时 1000 ms；`timerfd` 采样、`signalfd` 信号、可选 GPIO |
+| 单线程调度 | `src/main.cpp`（`epoll_wait` 在 :221，事件数组大小 8、超时 1000 ms） | `timerfd` 采样、`signalfd` 信号、可选 GPIO |
 | 有界任务队列 | `src/worker.cpp` | `--task-capacity`（默认 64）、提交失败即拒绝 |
-| 关闭顺序 | `src/main.cpp:170` | `worker.stop()` → `bus.stop()` → `sel.flush()` → `logger.flush()` |
+| 关闭顺序 | `src/main.cpp:296` 起 | `network.stop()` → peer → control → `worker.stop()` → `bus.stop()` → `uplink.stop()` → `sel.flush()` → `logger.flush()` |
 
 需求里有四种东西：只读管理、**控制面（写操作）**、上行遥测转发、实例间通信。它们的信任模型与失败模式不同，
 因此**不放进一个端口**：
@@ -31,20 +30,27 @@
 
 ## 2. 端口与信任模型
 
-| 端口 | 角色 | 开关 | 默认绑定 | 默认状态 | 认证 |
-|---|---|---|---|---|---|
-| `127.0.0.1:8000` | 只读（对齐现有 Python 能力） | `--http-port` | 回环 | **默认关闭** | 无 |
-| `0.0.0.0:8443` | 控制面 | `--control-port` + `--control-token-file` | 无 | **默认关闭（fail closed）** | 必需 |
-| 出站 | 上行转发 | 配置开关 | — | 默认关闭 | 采集器侧 |
+| 监听 | 角色 | 开关 | 默认绑定 | 认证 |
+|---|---|---|---|---|
+| 只读管理 | 只读（对齐现有 Python 能力） | `--http-port` | 回环 | 无 |
+| 控制面 | 受控写操作 | `--control-port` + `--control-token-file` | 回环，非回环强制 TLS | 必需 |
+| 心跳入站 | 实例间代次交换 | `--peer-address` + `--peer-port` + `--peer-listen-port` + `--peer-token-file` | 回环，非回环强制证书 | 必需 |
+| 上行出站 | 遥测转发 | `--uplink-address` + `--uplink-port` | — | 采集器侧 |
+| 心跳出站 | 心跳请求 | 同上 peer 选项 | — | 对端令牌 |
+
+三者都默认关闭：不给出对应开关就不创建任何监听套接字。
+
+只读、控制与心跳三个监听都由同一个 `ReadOnlyServer` 实现，区别只在构造重载、连接上限
+（只读 64 / 控制与心跳 8）、角色标签以及是否走 TLS。
 
 规则：
 
 1. 控制面**未配置凭证则不创建监听套接字**，而不是"裸奔但绑回环"。fail closed。
-2. 控制面一旦绑定非回环地址，**必须**启用 TLS。绑定非回环 + 无 TLS 会被视为配置错误而拒绝启动。
+2. 控制面与心跳端口一旦绑定非回环地址，**必须**启用 TLS/证书。绑定非回环 + 无证书会被视为配置错误而拒绝启动。
 3. 只读端口可以不出局域网；控制端口建议只在内网管理网段可达。
-4. **已定：只读服务默认关闭，必须用显式开关（`--http-port`）才监听。** 因此默认部署的攻击面与不做本组件时完全一致；
-   `--help` 与文档必须把"默认关闭"写清楚，避免使用者误以为它已经开着。
-5. 实例间通信**不在本设计范围内**（见第 8 节）。
+4. 只读服务必须用显式开关（`--http-port`）才监听，因此默认部署的攻击面与不启用该组件时完全一致；
+   `--help` 与文档都写明"默认关闭"，避免使用者误以为它已经开着。
+5. 实例间通信只做心跳与代次交换，**不做选主**（见第 8 节）。
 
 ## 3. 并发模型
 
@@ -61,16 +67,18 @@
 
 1. **网络线程只读**：读取 `SelStore::query()`（自带锁）、`EventBus` 订阅的快照、以及只读的传感器状态快照。
    不直接触碰 `MonitorSensor`、`Engine`、`FaultRuleEngine`。
-2. **所有写操作经 `Worker::submit`**，由主循环/工作线程执行——与 `src/monitor.cpp:38` 的恢复提交路径同一条，
+2. **所有写操作经 `Worker::submit`**，由主循环/工作线程执行——与 `src/monitor.cpp:39` 的恢复提交路径同一条，
    从而复用 `RecoveryPolicyEngine` 的冷却、去重与并发上限，以及 `PwmAction` 的取值校验。
 3. **禁止网络线程直接调 `write_pwm`**。这是本设计最重要的一条约束：一旦绕过，现有的冷却/去重/审计全部失效。
 
-关闭顺序扩展为：`net.stop()`（先停入站，不再接受新请求）→ `worker.stop()` → `bus.stop()`（**最后一条出站遥测在此之前发完**）
-→ `sel.flush()` → `logger.flush()`。`net.stop()` 必须在 `worker.stop()` 之前，否则在途控制请求会引用已销毁的工作线程。
+关闭顺序（`src/main.cpp:296` 起）：`network.stop()`（先停入站，不再接受新请求）→ `peer_network->stop()` →
+`peer->stop()` → `control_network->stop()` → `worker.stop()` → `bus.stop()`（**最后一条出站遥测在此之前发完**）
+→ `uplink->stop()` → `sel.flush()` → `logger.flush()`。网络必须在 `worker.stop()` 之前停止，
+否则在途控制请求会引用已销毁的工作线程。
 
-## 4. socket 抽象（先做，否则会重演 `core.cpp`）
+## 4. socket 抽象
 
-现有 `LinuxIo`（`include/bmc/linux_io.hpp`）已经证明了这个模式的价值。网络必须照做，否则会得到
+现有 `LinuxIo`（`include/bmc/linux_io.hpp`）已经证明了这个模式的价值。网络照做，否则会得到
 "有代码但无法测试"的第二个组件。
 
 ```cpp
@@ -82,19 +90,24 @@ public:
     virtual int bind(int descriptor, const sockaddr* address, socklen_t length) = 0;
     virtual int listen(int descriptor, int backlog) = 0;
     virtual int accept(int descriptor, sockaddr* address, socklen_t* length) = 0;
+    virtual int connect(int descriptor, const sockaddr* address, socklen_t length);  // 非纯虚，记录 errno
+    virtual int writable(int descriptor);                                            // poll 零超时探测
     virtual int setsockopt(int descriptor, int level, int name, const void* value, socklen_t length) = 0;
     virtual int getsockopt(int descriptor, int level, int name, void* value, socklen_t* length) = 0;
     virtual ssize_t recv(int descriptor, void* buffer, std::size_t count, int flags) = 0;
     virtual ssize_t send(int descriptor, const void* buffer, std::size_t count, int flags) = 0;
     virtual int shutdown(int descriptor, int how) = 0;
     int close(int descriptor) noexcept;  // 非虚，与 LinuxIo 一致
-    int last_error = 0;
+    std::atomic<int> last_error{0};      // 三个网络线程共享，必须原子
 };
 class PosixSocketIo final : public SocketIo { /* 直通 syscall */ };
 SocketIo& system_socket_io();
+std::string peer_name(const sockaddr* address, socklen_t length);  // "ip:port" / "[ip]:port"，诊断用
 ```
 
-`FakeSocketIo` 放在测试里（与 `FakeLinuxIo` 同处 `tests/core_test.cpp`），可脚本化：
+测试替身按需就近放置，刻意不共享：`FakeSocketIo`（`tests/core_test.cpp`）驱动解析与限流，
+`ScriptSocket`（`tests/network_test.cpp`）驱动连接状态机，`FakeUplinkSocket`（`tests/uplink_test.cpp`）
+与 `PeerSocket`（`tests/peer_test.cpp`）各自驱动出站状态机。可脚本化的行为包括：
 accept 返回预设连接、recv 返回分片/超长/半包、send 返回部分写入或 `EAGAIN`、getsockopt 返回错误。
 
 **用它可以单测、无需真端口的东西**：请求行/头部解析、超长头部拒绝、请求体上限、
@@ -102,7 +115,7 @@ accept 返回预设连接、recv 返回分片/超长/半包、send 返回部分�
 
 ## 5. 协议子集（HTTP/1.1 的严格子集）
 
-刻意做小而明确，避免引入框架（与项目零依赖取向一致，也不稀释"手写业务代码"口径）。
+刻意做小而明确，避免引入框架（与项目零依赖取向一致）。
 
 支持：
 - 方法与路径：`GET`（只读端口、控制端口）、`POST`（仅控制端口）
@@ -135,8 +148,8 @@ accept 返回预设连接、recv 返回分片/超长/半包、send 返回部分�
 
 | 路径 | 说明 |
 |---|---|
-| `GET /redfish/v1/` 及其下 `Managers`、`LogServices`、`Entries` | 与 `bmc_manage.py:30` 的 `resource()` 同形状 |
-| `GET /metrics` | 与 `bmc_manage.py:61` 的 `metrics()` 同文本格式 |
+| `GET /redfish/v1/` 及其下 `Managers`、`LogServices`、`Entries` | 与 `bmc_manage.py:57` 的 `resource()` 同形状 |
+| `GET /metrics` | 与 `bmc_manage.py:104` 的 `metrics()` 同文本格式 |
 | `GET /healthz` | 进程存活与采样计数（本地探针用） |
 
 控制端口：
@@ -153,11 +166,12 @@ accept 返回预设连接、recv 返回分片/超长/半包、send 返回部分�
 ## 7. 认证、审计与指标
 
 认证（控制端口）：
-- mTLS（推荐）或 `Authorization: Bearer <token>` **且必须走 TLS**
+- `Authorization: Bearer <token>`，**且绑定非回环地址时必须走 TLS**
 - **已定：令牌从文件读取，权限 `0640`、属主为服务账户**（`--control-token-file`），
   **不接受命令行明文传入**（会出现在 `ps` 与 journal 里）。令牌文件缺失或权限过宽时控制端口不监听。
 - 校验用常数时间比较；失败返回 401 且不区分"令牌错"与"令牌缺失"之外的细节
 - 失败按来源地址计数并限流（避免暴力枚举）
+- 未实现客户端证书认证（mTLS）；单令牌方案已足够覆盖当前使用场景
 
 审计：每个控制请求写 SEL（`logger.action` + `sel.append(..., important=true)`），字段固定为
 `action`、`sensor`、`outcome`（accepted/rejected/unauthorized/rate-limited）、`peer`、`request_id`。
@@ -196,29 +210,30 @@ bmc_uplink_queued{...} / bmc_uplink_dropped_total   # 上行转发的有界队�
   不需要新增写路径；若启用 TLS，需 `ReadOnlyPaths` 指向证书与令牌文件。
 - 控制端口默认不监听，因此默认部署的攻击面与现在**完全一致**。
 
-## 10. 分阶段落地
+## 10. 组件划分与规模
 
-| 阶段 | 内容 | 可独立验证的点 | 规模 |
+| 组件 | 内容 | 可独立验证的点 | 规模 |
 |---|---|---|---|
-| 1 | `SocketIo` 抽象 + `FakeSocketIo` + HTTP 解析器 + 限流 | 单测，无需真端口 | 500–700 行 |
-| 2 | 只读 HTTP 服务（独立线程，绑回环） | 与 Python 工具输出逐字对拍 | 600–900 行 |
-| 3 | 控制面：认证 + fail-closed + 拒绝路径（先接空操作） | 无凭证不监听、401、限流、审计落 SEL | 700–1000 行 |
-| 4 | 控制面接 `Worker` + `RecoveryPolicyEngine`；TLS | 冷却/去重仍生效；明文绑定非回环被拒 | 800–1200 行 |
-| 5 | 上行转发（`EventBus` 订阅 + 有界队列 + 指标） | 队列满丢最旧并计数 | 400–600 行 |
-| 6 | 实例间心跳（仅心跳与代次交换） | 陈旧检测 | 300–500 行 |
+| 基础 | `SocketIo` 抽象 + `FakeSocketIo` + HTTP 解析器 + 限流 | 单测，无需真端口 | 500–700 行 |
+| 只读服务 | 只读 HTTP 服务（独立线程，绑回环） | 与 Python 工具输出逐字对拍 | 600–900 行 |
+| 控制面 | 认证 + fail-closed + 拒绝路径 | 无凭证不监听、401、限流、审计落 SEL | 700–1000 行 |
+| 控制执行 | 控制面接 `Worker` + `RecoveryPolicyEngine`；TLS | 冷却/去重仍生效；明文绑定非回环被拒 | 800–1200 行 |
+| 上行转发 | 上行转发（`EventBus` 订阅 + 有界队列 + 指标） | 队列满丢最旧并计数 | 400–600 行 |
+| 实例心跳 | 实例间心跳（仅心跳与代次交换） | 陈旧检测 | 300–500 行 |
 
-合计约 3.3–4.9k 行（含测试）。阶段 3 与 4 之间没有"安全的中间态"，**要么都不做，要么一起做**。
+合计约 3.3–4.9k 行（含测试）。控制面的认证与控制执行两部分不可分离：只做认证不接 `Worker`
+会留下一个"看起来能控制但实际不生效"的中间态，因此两者一起实现。
 
 ## 11. 明确不做
 
 - 不做 keep-alive/流水线、不做 chunked、不做 HTTP/2
-- 不做 WebSocket/SSE 推送（第一版只做请求-响应）
+- 不做 WebSocket/SSE 推送（只做请求-响应）
 - 不做多用户/角色体系（单一控制令牌足够）
 - 不做自己实现选主
 - 不允许控制请求指定文件路径
 - 不引入 HTTP 框架
 
-## 12. 验收判据
+## 12. 验收要点
 
 1. 控制端口未配置凭证时**不创建监听套接字**（用 `ss -ltn` 验证）
 2. 明文绑定非回环地址时**拒绝启动并给出明确报错**

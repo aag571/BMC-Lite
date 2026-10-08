@@ -6,9 +6,9 @@
 
 ## 数据流
 
-配置 -> HardwareMonitor -> Sample -> ThresholdEngine -> FaultEvent -> FaultLogger / RecoveryExecutor
+配置 -> prepare_sensors -> Device::read_value -> Engine::update -> Event -> Logger / SelStore / EventBus / FaultRuleEngine -> RecoveryPolicyEngine -> Action
 
-epoll 统一调度 timerfd 和 signalfd。hwmon 通常不支持可靠的 POLLPRI，因此默认定时读取；GPIO sysfs 中断可以独立注册 EPOLLPRI。事件循环只负责采样和状态转换；恢复动作交给有界工作队列，不能阻塞事件循环。
+epoll 统一调度 timerfd 和 signalfd。hwmon 通常不支持可靠的 POLLPRI，因此默认定时读取；GPIO sysfs 中断可以独立注册 EPOLLPRI。事件循环只负责采样和状态转换；恢复动作交给有界工作队列，不能阻塞事件循环。只读 HTTP、控制面与实例心跳各自运行在独立线程和独立的 epoll 上，只通过加锁快照读取 SEL 与配置，不触碰采样对象。
 
 ## 分层
 
@@ -19,7 +19,7 @@ epoll 统一调度 timerfd 和 signalfd。hwmon 通常不支持可靠的 POLLPRI
 
 ## 故障状态机
 
-Normal / Warning / Critical / Unavailable。高温和低转速采用可配置方向。连续异常计数达到窗口后升级；迟滞区间保持当前等级；恢复需要连续正常样本。读取失败单独累计，达到门限进入 Unavailable。NaN 与无穷值视为读取失败，不能参与数值比较。状态变化才生成 FaultEvent，事件包含旧状态、现值、原因、时间和序号。
+Normal / Warning / Critical / Unavailable。高温和低转速采用可配置方向。连续异常计数达到窗口后升级；迟滞区间保持当前等级；恢复需要连续正常样本。读取失败单独累计，达到门限进入 Unavailable。NaN 与无穷值视为读取失败，不能参与数值比较。状态变化才生成 Event，事件包含旧状态、新状态、现值、原因和序号；落盘时间戳由 SEL 记录补充。
 
 ## 恢复与权限
 
@@ -27,8 +27,8 @@ Normal / Warning / Critical / Unavailable。高温和低转速采用可配置方
 
 ## 可观测性与可靠性
 
-JSONL 日志支持大小轮转和保留数量。采样错误不能退出整个服务。配置错误阻止启动。SIGINT/SIGTERM 经 signalfd 触发有序停止，工作线程 drain 后退出。所有设备 fd 使用 RAII；I2C 失败必须保留 errno。日志失败作为服务异常退出，避免失去故障证据。
+JSONL 日志支持大小轮转和保留数量。采样错误不能退出整个服务。配置错误阻止启动。SIGINT/SIGTERM 经 signalfd 触发有序停止，工作线程 drain 后退出。所有设备 fd 使用 RAII；I2C 失败必须保留 errno。日志与 SEL 的写入失败都只累计计数并向 SEL 上报降级状态，不终止服务；退出时若缓冲区仍未落盘则返回非零码并在 stderr 说明原因。
 
 ## 验证与限制
 
-GoogleTest 验证边界、去抖、迟滞、读取失败与恢复；参数矩阵使用独立预期计算。模拟集成验证真实 epoll 循环、日志和信号退出。ASan/UBSan 用于内存与未定义行为检查。虚拟机测试不能证明真实 I2C/GPIO/PWM 电气行为，实机验收需要目标板及权限。
+GoogleTest 覆盖边界、去抖、迟滞、读取失败与恢复，逐字对拍用例以 Python 参考实现的输出为预期值。模拟集成与 Python 脚本验证真实 epoll 循环、信号退出、热加载与网络服务。ASan/UBSan 与 TSan 用于内存、未定义行为与数据竞争检查。虚拟机测试不能证明真实 I2C/GPIO/PWM 电气行为，实机验证需要目标板及权限。

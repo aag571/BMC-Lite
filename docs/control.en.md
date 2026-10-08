@@ -50,8 +50,8 @@ For manual execution, set ownership to the account running the binary. Never pas
 
 Copy cert.pem to the client as a trust anchor. Keep the private key on the server. In managed
 networks use an internal CA certificate. Clients verify both chain and hostname/IP with --cacert;
-do not use curl -k. This is server TLS plus Bearer authentication, not mTLS or an outbound TLS
-client. Restart after certificate/token rotation.
+do not use curl -k. This is server TLS plus Bearer authentication, not mTLS.
+Restart after certificate/token rotation.
 
 ## Enable systemd
 
@@ -104,7 +104,8 @@ Responses: 200 query success; 202 queued; 400 invalid request; 401 bad credentia
 Outcomes include requested/accepted/rejected/unauthorized/rate-limited. A valid action is audited
 as requested before queueing and as accepted only after successful queueing. No action runs until
 the accepted audit is durable. Correlate validation and execution
-by request_id; detail can be completed, cooldown or failed. Accepted validation can be followed by
+by request_id; detail can be completed, failed, cooldown, already running, concurrency limit or
+state capacity. Accepted validation can be followed by
 queue rejection or action failure.
 
 ## Audit, reload and tests

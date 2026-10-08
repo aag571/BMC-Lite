@@ -42,7 +42,7 @@ Nonloopback outgoing traffic requires a CA and verified server name; nonloopback
 
 ## Protocol and bounds
 
-GET /v1/heartbeat with Authorization: Bearer and X-BMC-Generation headers; 200 returns the local generation as decimal text plus newline. Other routes/actions return 400; invalid credentials return 401/429. At most eight inbound connections, one outbound exchange, 8 KiB response buffer, 32..512 character tokens. Use a 64-character random hexadecimal token.
+GET /v1/heartbeat with Authorization: Bearer and X-BMC-Generation headers; 200 returns the local generation as decimal text plus newline. The token is checked before the route: missing or wrong credentials always return 401, and repeated failures return 429 after per-source rate limiting; a valid token with an unknown route, wrong method or bad generation returns 400. At most eight inbound connections, one outbound exchange, 8 KiB response buffer, 32..512 character tokens. Use a 64-character random hexadecimal token.
 
 Connect/send/recv are nonblocking. Each exchange has an absolute min(5s, stale_ms) deadline. Retry interval is interval_ms (>=10ms); stale_ms must exceed it. Stop waits at most one 10ms thread sleep. Valid incoming requests or verified outgoing responses refresh liveness. Generation is observed, never automatically applied to local configuration.
 

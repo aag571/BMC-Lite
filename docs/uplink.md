@@ -6,7 +6,7 @@
 
 ## 运行与部署
 
-先在采集器 Linux 上打开一个演示接收端：
+先在采集器 Linux 上打开一个接收端：
 
 ```sh
 sudo apt-get install -y netcat-openbsd

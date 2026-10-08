@@ -35,6 +35,14 @@
 #include <unistd.h>
 #include <vector>
 
+// 本文件覆盖 bmc-lite 中除网络与控制面之外的核心逻辑：
+//   - Engine / Config / Reader / Pwm：阈值判定、去抖与迟滞、配置解析、读取器与 PWM 写入；
+//   - Calibration：线性项、分段插值与区间外钳制；
+//   - Chips：lm75 / adm1275 / ina219 / ina226 / emc2103 的寄存器解码与换算；
+//   - Device / EventBus / Worker / Rules / Recovery：设备生命周期、事件分发、任务队列与恢复策略；
+//   - Sel / Logger：持久化格式、批量落盘、压实、撕裂尾部修复与写失败降级；
+//   - Cli / SocketIo / HttpParser / RateLimiter / ReadOnlyService：命令行与 TCP 外围组件。
+// 除少数直接验证 Posix 直通实现的用例外，硬件访问全部由伪造的 LinuxIo / SocketIo 承接。
 namespace {
 bmc::Config policy() {
     bmc::Config config;
@@ -47,6 +55,16 @@ std::filesystem::path temporary(const std::string& suffix) {
     return std::filesystem::temp_directory_path() / ("bmc-test-" + std::to_string(::getpid()) + suffix);
 }
 // 脚本化的 LinuxIo：让 I2C / GPIO / PWM 路径不需要真实 /dev/i2c-* 与 /dev/gpiochip* 就能被单元测试覆盖。
+// 可脚本化的虚调用与配置方式：
+//   - open()：按路径分配并复用描述符；"/dev/fake-open-failure" 稳定返回 ENOENT。
+//   - ioctl()：应答存放在 Descriptor::replies 中。SMBus 字节读以命令码为键，字/块读统一以
+//     I2C_SMBUS 为键（寄存器号在 transaction->command 中）；序列多于一个元素时逐次消费，
+//     只剩一个元素时反复返回。I2C_FUNCS 的能力位来自 i2c_functions，用例可直接改写。
+//   - GPIO 行请求会真的 ::open("/dev/null", O_RDONLY | O_CLOEXEC)，因此 CLOEXEC 与析构关闭
+//     由真实描述符验证，只有行值来自脚本化 ioctl。
+//   - write()：内容记入 Descriptor::writes；short_write 让下一次写返回 count-1，
+//     用来验证调用方确实会检测短写。
+// 明确不模拟：真实芯片时序、SMBus 错误状态、内核返回的零散字节数与并发访问。
 class FakeLinuxIo final : public bmc::LinuxIo {
 public:
     struct Descriptor {
@@ -181,6 +199,7 @@ public:
     int next_descriptor = 101;
     int line_descriptor = -1;
 };
+// ============ Engine：去抖、迟滞与读取失败 ============
 TEST(Engine, DebouncesCriticalAndUsesInclusiveBoundary) {
     bmc::Engine engine(policy());
     EXPECT_FALSE(engine.update(90));
@@ -225,6 +244,7 @@ TEST(Engine, InvalidSamplesBecomeUnavailableAndRecover) {
     ASSERT_TRUE(engine.update(40));
     EXPECT_EQ(engine.state(), bmc::State::normal);
 }
+// 读取失败会清空已累计的去抖计数，恢复后必须重新数满 debounce 次才会翻转。
 TEST(Engine, FailedReadingBreaksPendingTransition) {
     bmc::Engine engine(policy());
     EXPECT_FALSE(engine.update(95));
@@ -251,6 +271,7 @@ TEST(Engine, LowDirectionAndRecovery) {
     ASSERT_TRUE(engine.update(1601));
     EXPECT_EQ(engine.state(), bmc::State::normal);
 }
+// ============ Config / Reader / Logger / Worker / Pwm：基础组件与校验 ============
 TEST(Config, RejectsBrokenThresholdsAndWindows) {
     auto config = policy();
     config.critical = config.warning;
@@ -328,6 +349,7 @@ TEST(Pwm, ValidatesAndWritesConfiguredFile) {
     EXPECT_EQ(value, 255u);
     std::filesystem::remove(path);
 }
+// ============ Calibration：线性项、插值、钳制与配置解析 ============
 TEST(Calibration, DefaultIsIdentityAndLinearTermsApply) {
     bmc::Calibration identity;
     EXPECT_DOUBLE_EQ(bmc::apply(identity, 42.5), 42.5);
@@ -377,6 +399,20 @@ TEST(Calibration, ValidateRejectsUnsortedOrNonFinitePoints) {
     config.calibration.points = {{5, 1}, {10, 2}};
     EXPECT_NO_THROW(bmc::validate(config));
 }
+// gain 必须为正：查表用的是 corrected = raw*gain+offset，负 gain 会让递增的标定点
+// 在查表域里变成递减，区间查找随即落进错误的段并静默返回错误值。
+TEST(Calibration, ValidateRejectsNonPositiveGain) {
+    auto config = policy();
+    config.calibration.gain = 0;
+    EXPECT_THROW(bmc::validate(config), std::invalid_argument);
+    config = policy();
+    config.calibration.gain = -1;
+    EXPECT_THROW(bmc::validate(config), std::invalid_argument);
+    config = policy();
+    config.calibration.gain = 0.5;
+    config.calibration.points = {{5, 1}, {10, 2}};
+    EXPECT_NO_THROW(bmc::validate(config));
+}
 TEST(Calibration, ConfigLineParsesOptionalTwelfthField) {
     const auto path = temporary("-calibration");
     // 旧格式（11 字段）保持可用，标定为默认恒等。
@@ -404,6 +440,7 @@ TEST(Calibration, ConfigLineParsesOptionalTwelfthField) {
     EXPECT_THROW(bmc::load_config(path), std::invalid_argument);
     std::filesystem::remove(path);
 }
+// ============ Chips：各芯片驱动的寄存器解码与换算 ============
 // 以下是专用芯片驱动的寄存器语义用例：只验证解码与换算，不验证电气行为。
 // 脚本直接挂在 open() 会分配的 101 号描述符上。
 namespace {
@@ -584,6 +621,17 @@ TEST(ChipConfig, ChipBackendParsesAndRejectsUnknownNames) {
     EXPECT_EQ(configs[0].backend, "i2c:lm75b");
     { std::ofstream output(path); output << "temp i2c:lm99 /dev/i2c-1,0x48 1 high 70 90 3 3 3 -\n"; }
     EXPECT_THROW(bmc::load_config(path), std::invalid_argument);
+    // 后端语法是 i2c:<chip>[@<feature>]：型号名只取 "@" 之前的部分，
+    // 测量量留给构造期 make_chip 校验，因此这些写法都必须在装载阶段通过。
+    { std::ofstream output(path); output << "fan i2c:emc2103@rpm /dev/i2c-1,0x2E 1 low 500 200 20 3 3 -\n"; }
+    configs = bmc::load_config(path);
+    ASSERT_EQ(configs.size(), 1u);
+    EXPECT_EQ(configs[0].backend, "i2c:emc2103@rpm");
+    { std::ofstream output(path); output << "vout i2c:adm1275@vout /dev/i2c-1,0x10 1 high 12 13 0.5 3 3 -\n"; }
+    EXPECT_NO_THROW(bmc::load_config(path));
+    // 带 @ 也不能放过真正未知的型号。
+    { std::ofstream output(path); output << "temp i2c:lm99@temp /dev/i2c-1,0x48 1 high 70 90 3 3 3 -\n"; }
+    EXPECT_THROW(bmc::load_config(path), std::invalid_argument);
     { std::ofstream output(path); output << "temp i2c:lm75 /dev/i2c-1,0x48,0x00 1 high 70 90 3 3 3 -\n"; }
     configs = bmc::load_config(path);
     ASSERT_EQ(configs.size(), 1u);
@@ -593,6 +641,7 @@ TEST(ChipConfig, ChipBackendParsesAndRejectsUnknownNames) {
     EXPECT_THROW(bmc::make_reader(configs[0], fake), std::invalid_argument);
     std::filesystem::remove(path);
 }
+// ============ FakeIo / Device：注入式 I/O 与设备适配 ============
 // 以下用例验证"注入后的调用链"，而不是真实硬件行为。
 std::uint16_t decode_i2c_word(const std::vector<std::uint8_t>& bytes) {
     std::uint16_t word = 0;
@@ -605,6 +654,7 @@ unsigned long read_i2c_functions(FakeLinuxIo& fake) {
     std::memcpy(&value, bytes.data(), sizeof(value));
     return value;
 }
+// 只有伪 Io 真的返回 count-1，write_pwm 的短写检测分支才被覆盖到。
 TEST(FakeIo, RequiresARealShortWriteToBeDetectable) {
     FakeLinuxIo fake;
     bmc::write_pwm("/dev/fake-pwm", 200, fake);
@@ -661,6 +711,7 @@ TEST(FakeIo, I2cReaderDecodesWordAndScalesIt) {
     EXPECT_EQ(fake.opened.size(), 1u);
     EXPECT_EQ(fake.opened[0], "/dev/fake-i2c");
 }
+// 行值来自脚本化 ioctl，但描述符是真实的 /dev/null：CLOEXEC 与析构时关闭都真实生效。
 TEST(FakeIo, GpioLineValuesFailureAndDescriptorLifetime) {
     FakeLinuxIo fake;
     auto config = policy(); config.backend = "gpio"; config.path = "/dev/fake-gpiochip,1,active-low";
@@ -719,6 +770,7 @@ TEST(Device, SysfsAdapterReportsDegradedState) {
     EXPECT_EQ(device->state(), bmc::DeviceState::failed);
     EXPECT_FALSE(device->probe());
 }
+// ============ EventBus / Rules / Recovery：事件分发、策略与恢复 ============
 TEST(EventBus, DeliversFilteredEventsAndSequencesThem) {
     bmc::EventBus bus(8);
     std::mutex mutex;
@@ -797,6 +849,28 @@ TEST(Recovery, SeparateWorkerCanRunWhileAnotherActionWaits) {
     worker.stop();
     EXPECT_EQ(status, std::future_status::ready);
 }
+TEST(Recovery, SameKeyAlreadyRunningIsReportedSeparatelyFromTheConcurrencyCap) {
+    // 同一（传感器, 动作）重入属于去重，不是并发额度不足；两种拒绝必须给出不同 detail，
+    // 否则按 detail 分类的调用方会把重入误判成扩容信号。
+    std::promise<void> entered, release;
+    auto hold = release.get_future().share();
+    bmc::RecoveryPolicyEngine recovery([&](const bmc::RecoveryRequest& request) {
+        if (request.sensor != "slow") return true;
+        entered.set_value();
+        hold.wait();
+        return true;
+    }, std::chrono::milliseconds(0), 1, 2);
+    bmc::Worker worker(4, 2);
+    ASSERT_TRUE(worker.submit([&] { recovery.submit({"rule", "slow", "increase_fan", 1}); }));
+    entered.get_future().wait();
+    // 执行器已被占用，但这是同一把键的重入：去重分支先命中。
+    const auto duplicate = recovery.submit({"rule", "slow", "increase_fan", 2});
+    ASSERT_TRUE(duplicate);
+    EXPECT_FALSE(duplicate->accepted);
+    EXPECT_EQ(duplicate->detail, "already running");
+    release.set_value();
+    worker.stop();
+}
 TEST(Recovery, ManyFailuresKeepTotalBackoffBounded) {
     bmc::RecoveryPolicyEngine recovery([](const bmc::RecoveryRequest&) { return false; },
         std::chrono::milliseconds(0), 8, 1);
@@ -811,6 +885,7 @@ TEST(Recovery, RejectsInvalidPolicy) {
     EXPECT_THROW(bmc::RecoveryPolicyEngine(nullptr), std::invalid_argument);
     EXPECT_THROW(bmc::RecoveryPolicyEngine([](const bmc::RecoveryRequest&) { return true; }, std::chrono::seconds(1), 0), std::invalid_argument);
 }
+// 传感器反复出现又消失时冷却状态不能无限增长，总量始终被 4096 条上限兜住。
 TEST(Recovery, DisappearingSensorsHaveBoundedCooldownState) {
     bmc::RecoveryPolicyEngine recovery([](const auto&) { return true; }, std::chrono::milliseconds(0), 1);
     for (unsigned index = 0; index < 10000; ++index) {
@@ -819,6 +894,7 @@ TEST(Recovery, DisappearingSensorsHaveBoundedCooldownState) {
         EXPECT_LE(recovery.runtime_size(), 4096u);
     }
 }
+// 容量满时新传感器以 "state capacity" 被拒，但已入表传感器的冷却语义不受影响。
 TEST(Recovery, StateCapacityPreservesExistingCooldowns) {
     bmc::RecoveryPolicyEngine recovery([](const auto&) { return true; }, std::chrono::hours(1), 1);
     for (unsigned index = 0; index < 4096; ++index)
@@ -827,6 +903,7 @@ TEST(Recovery, StateCapacityPreservesExistingCooldowns) {
     EXPECT_EQ(recovery.submit({"rule", "extra", "inspect_device", 0})->detail, "state capacity");
     EXPECT_EQ(recovery.submit({"rule", "sensor-0", "inspect_device", 0})->detail, "cooldown");
 }
+// ============ Sel / Logger：持久化加固与写失败降级 ============
 TEST(Sel, PersistsSequencesAndLimitsRecords) {
     const auto path = temporary("-sel.db");
     { bmc::SelStore store(path, 2); EXPECT_EQ(store.append("cpu", "critical", "hot", 95), 1u); EXPECT_EQ(store.append("cpu", "normal", "clear"), 2u); EXPECT_EQ(store.append("fan", "failed", "stalled"), 3u); EXPECT_EQ(store.query().size(), 2u); }
@@ -836,6 +913,7 @@ TEST(Sel, PersistsSequencesAndLimitsRecords) {
     EXPECT_EQ(restored.next_id(), 4u);
     std::filesystem::remove(path);
 }
+// 压实必须幂等：反复重开并压实后既不能丢记录，也不能让同一记录重复落盘。
 TEST(Sel, AppendsAfterRepeatedCompactionPersistExactlyOnce) {
     const auto path = temporary("-sel-compact-reopen.db");
     {
@@ -1111,6 +1189,7 @@ TEST(Logger, RotatesThroughPersistentDescriptor) {
         std::filesystem::remove(path.string() + suffix);
     }
 }
+// ============ Gpio / Worker / FaultInjection：硬件路径、任务队列与故障注入 ============
 TEST(Gpio, RejectsMalformedPathsBeforeOpeningHardware) {
     auto config = policy();
     config.backend = "gpio";
@@ -1144,6 +1223,7 @@ TEST(Worker, IsolatesExceptionsAndReportsConcurrentCompletion) {
     EXPECT_EQ(stats.running, 0u);
     EXPECT_EQ(stats.queued, 0u);
 }
+// 数值大的优先级先出队，同优先级的任务保持提交顺序。
 TEST(Worker, OrdersQueuedTasksByPriorityAndPreservesTies) {
     bmc::Worker worker(8);
     std::promise<void> entered;
@@ -1170,6 +1250,7 @@ TEST(FaultInjection, EventSubscriberExceptionDoesNotStopDelivery) {
     bus.stop();
     EXPECT_EQ(received.load(), 1u);
 }
+// 执行器抛出的异常按一次失败尝试计数，既不上抛也不削减重试次数。
 TEST(FaultInjection, RecoveryExecutorExceptionExhaustsAttempts) {
     unsigned attempts = 0;
     bmc::RecoveryPolicyEngine engine([&attempts](const bmc::RecoveryRequest&) -> bool {
@@ -1183,6 +1264,7 @@ TEST(FaultInjection, RecoveryExecutorExceptionExhaustsAttempts) {
     EXPECT_EQ(result->attempts, 3u);
     EXPECT_EQ(attempts, 3u);
 }
+// ============ Rules：通配传感器与热重载的状态合并语义 ============
 TEST(Rules, WildcardSensorsHaveIndependentState) {
     bmc::FaultRuleEngine engine({{"all", "*", bmc::State::critical, 1, 1, "inspect_device"}});
     EXPECT_EQ(engine.evaluate({"cpu", bmc::State::normal, bmc::State::critical, 95, "sample", 1}).size(), 1u);
@@ -1242,6 +1324,7 @@ TEST(Rules, ReloadRejectsInvalidPolicy) {
     // 合并失败后原有规则仍然可用。
     EXPECT_EQ(engine.evaluate({"cpu", bmc::State::normal, bmc::State::critical, 95, "sample", 1}).size(), 1u);
 }
+// ============ Cli：参数解析与 usage 文案 ============
 TEST(Cli, HelpWinsAnywhereAndIgnoresOtherArguments) {
     // --help 出现在任意位置都生效，并且优先于其它（甚至非法的）参数。
     for (const auto& arguments : std::vector<std::vector<std::string>>{
@@ -1333,9 +1416,17 @@ TEST(Cli, UsageMentionsEverySupportedOption) {
     }
 }
 
+// ============ SocketIo / HttpParser / RateLimiter：外围 TCP 组件 ============
 // ---- TCP 组件的可测地基：socket 抽象、HTTP 严格子集解析、限流 ----
 
 // 脚本化的 SocketIo：让连接状态机、解析与限流都能在没有真实端口的情况下测试。
+// 可脚本化的部分：
+//   - socket/bind/listen/accept/setsockopt/getsockopt/shutdown 各有一个 xxx_results 队列，
+//     队列为空时返回默认值；每次调用都记入对应的 xxx_calls，便于断言调用序列与参数。
+//   - accept 队列耗尽后返回 -1 并置 EAGAIN，模拟"暂时没有更多连接"；成功时回填回环地址。
+//   - recv：incoming 是待读分片队列，每片按自身长度返回，可构造半包与粘包；队列空时置 EAGAIN。
+//   - send：默认整包成功并累积到 sent；send_results 非空时逐次消费，用来构造部分写与 EPIPE。
+// 明确不模拟：fd 的真实生命周期（close 是非虚的真实 ::close）、真实网络可达性与阻塞超时。
 class FakeSocketIo final : public bmc::SocketIo {
 public:
     struct Reply {
@@ -1772,15 +1863,22 @@ TEST(RateLimiter, RejectsInvalidConfiguration) {
     EXPECT_THROW(bmc::http::RateLimiter(1, 1.0, 0), std::invalid_argument);
 }
 
+// ============ ReadOnlyService：与 Python 参考实现逐字对拍 ============
 // ---- Read-only service: byte-for-byte parity with tools/bmc_manage.py ----
 // The golden vectors come from tools/gen_service_vectors.py, which runs the reference
 // Python implementation, so these tests fail if the C++ output drifts even by one byte.
 
+// 锁定 Python json.dumps 的排版细节：分隔符、整数值浮点、转义与键序，差一个字节即失败。
 TEST(ReadOnlyService, JsonWriterMatchesPythonDumpsFormatting) {
-    // Separators are ", " and ": "; integral floats print without a fractional part.
+    // Separators are ", " and ": ". 整数值的浮点省略小数部分：这与生成的向量一致，
+    // 因为生成器把整数记录原样交给 json.dumps（json.dumps(95) -> "95"），
+    // 只在 C++ 字面量那一侧用 float() 换算。
     EXPECT_EQ(bmc::JsonWriter::dump(bmc::JsonWriter::Value::of(95.0)), "95");
     EXPECT_EQ(bmc::JsonWriter::dump(bmc::JsonWriter::Value::of(41.5)), "41.5");
     EXPECT_EQ(bmc::JsonWriter::dump(bmc::JsonWriter::Value::of(0.125)), "0.125");
+    // 指数 >= 16 保持科学计数法，1e15 仍展开为整数，两者都与 json.dumps 相同。
+    EXPECT_EQ(bmc::JsonWriter::dump(bmc::JsonWriter::Value::of(1e15)), "1000000000000000");
+    EXPECT_EQ(bmc::JsonWriter::dump(bmc::JsonWriter::Value::of(1e16)), "1e+16");
     EXPECT_EQ(bmc::JsonWriter::dump(bmc::JsonWriter::Value::of(static_cast<std::int64_t>(1700000000000))),
               "1700000000000");
     EXPECT_EQ(bmc::JsonWriter::dump(bmc::JsonWriter::Value::null()), "null");

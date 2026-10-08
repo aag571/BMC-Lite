@@ -1,6 +1,7 @@
 # Runtime reliability fixes
 
-This stage implements residual items A/B/C from 后续方案.md. It adds no listeners or threads.
+This document covers logger degradation reporting, rule-state pruning and chip verification
+boundaries. It adds no listeners or threads.
 
 ## Logger degradation
 

@@ -45,7 +45,7 @@ rm /tmp/bmc-control-token
 内容是至少 32 字节的可打印非空白字符，可有一个结尾换行。不能用命令行传入令牌。
 本地手动运行时，将令牌文件属主设为当前用户，而不是 bmc-lite。
 
-演示虚拟机 192.168.124.128 可生成如下自签名证书；将证书作为客户端信任锚，
+测试虚拟机 192.168.124.128 可生成如下自签名证书；将证书作为客户端信任锚，
 私钥只保留在服务器上。正式管理网络使用内部 CA 签发的证书。
 
 ```sh
@@ -58,7 +58,7 @@ rm /tmp/bmc-key.pem
 ```
 
 将 cert.pem 复制到调用客户端。用 --cacert 验证证书链与 URL 主机名/IP；不使用 curl -k。
-这里实现的是服务器证书加 Bearer 认证，没有实现客户端证书认证或出站 TLS。
+这里实现的是服务器证书加 Bearer 认证，没有实现客户端证书认证（mTLS）。
 证书与令牌在启动时读取，轮换后重启服务。
 
 ## 3. 开启 systemd 服务
@@ -123,7 +123,7 @@ sensor 必须是当前配置中存在的 ID；风扇动作还需配置 action_pa
 SEL 保存 requested/accepted/rejected/unauthorized/rate-limited、action、sensor、peer、request_id。
 动作先记录 requested，成功排队后才记录 accepted；审计未成功持久化时不会执行动作。
 同一 request_id 后续还会记录实际恢复结果。SEL 的普通文件 fdatasync 仍可能受磁盘延迟影响。
-accepted 请求验证记录与异步执行结果可通过 request_id 关联，执行结果 detail 可为 completed、cooldown 或 failed。
+accepted 请求验证记录与异步执行结果可通过 request_id 关联，执行结果 detail 可为 completed、failed、cooldown、already running、concurrency limit 或 state capacity。
 accepted 验证记录之后也可能出现队列拒绝或动作失败，必须查看异步结果。
 
 ## 5. 查看审计和重载
