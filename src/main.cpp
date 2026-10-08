@@ -1,3 +1,4 @@
+#include "bmc/cli.hpp"
 #include "bmc/core.hpp"
 #include "bmc/monitor.hpp"
 #include "bmc/action.hpp"
@@ -5,6 +6,7 @@
 #include <atomic>
 #include <cerrno>
 #include <csignal>
+#include <cstring>
 #include <filesystem>
 #include <fcntl.h>
 #include <iostream>
@@ -20,70 +22,6 @@
 #include <vector>
 
 namespace {
-struct Options {
-    std::string config = "config/mock.conf";
-    std::string log = "var/faults.jsonl";
-    std::string rules = "config/rules.conf";
-    std::string sel = "var/sel.db";
-    std::string gpio;
-    unsigned interval_ms = 1000;
-    unsigned ticks = 0;
-    unsigned worker_threads = 1;
-    unsigned task_capacity = 64;
-    bool enable_actions = false;
-    bool check_config = false;
-};
-unsigned positive(const std::string& token) {
-    std::size_t end = 0;
-    if (token.empty() || token.front() == '-') {
-        throw std::invalid_argument("expected positive integer");
-    }
-    const auto value = std::stoul(token, &end);
-    if (end != token.size() || value == 0 || value > 1000000) {
-        throw std::invalid_argument("integer outside supported range");
-    }
-    return static_cast<unsigned>(value);
-}
-Options options(int count, char** arguments) {
-    Options result;
-    for (int index = 1; index < count; ++index) {
-        const std::string argument = arguments[index];
-        if (argument == "--enable-actions") {
-            result.enable_actions = true;
-            continue;
-        }
-        if (argument == "--check-config") {
-            result.check_config = true;
-            continue;
-        }
-        if (index + 1 >= count) {
-            throw std::invalid_argument("missing option value: " + argument);
-        }
-        const std::string value = arguments[++index];
-        if (argument == "--config") {
-            result.config = value;
-        } else if (argument == "--rules") {
-            result.rules = value;
-        } else if (argument == "--sel") {
-            result.sel = value;
-        } else if (argument == "--log") {
-            result.log = value;
-        } else if (argument == "--gpio") {
-            result.gpio = value;
-        } else if (argument == "--interval-ms") {
-            result.interval_ms = positive(value);
-        } else if (argument == "--ticks") {
-            result.ticks = positive(value);
-        } else if (argument == "--worker-threads") {
-            result.worker_threads = positive(value);
-        } else if (argument == "--task-capacity") {
-            result.task_capacity = positive(value);
-        } else {
-            throw std::invalid_argument("unknown option: " + argument);
-        }
-    }
-    return result;
-}
 [[noreturn]] void fail(const std::string& message) {
     throw std::system_error(errno, std::generic_category(), message);
 }
@@ -98,15 +36,16 @@ void add(int poller, int descriptor, std::uint32_t events) {
         fail("register event descriptor");
     }
 }
-int run(const Options& settings) {
+int run(const bmc::CliOptions& settings) {
     sigset_t signals;
     ::sigemptyset(&signals);
     ::sigaddset(&signals, SIGINT);
     ::sigaddset(&signals, SIGTERM);
     ::sigaddset(&signals, SIGHUP);
+    // pthread_sigmask 返回的是错误号本身，不会设置 errno，因此不能用 generic_category 解释它。
     const int signal_result = ::pthread_sigmask(SIG_BLOCK, &signals, nullptr);
     if (signal_result != 0) {
-        throw std::system_error(signal_result, std::generic_category(), "block signals");
+        throw std::runtime_error(std::string("block signals: ") + std::strerror(signal_result));
     }
     bmc::Logger logger(settings.log);
     bmc::SelStore sel(settings.sel);
@@ -254,12 +193,20 @@ int run(const Options& settings) {
 }
 }
 int main(int count, char** arguments) {
+    const std::vector<std::string> tokens(arguments + 1, arguments + count);
+    // --help 出现在任意位置都生效；解析失败时也优先给出用法而不是只报一行错误。
+    bmc::CliOptions settings;
     try {
-        if (count == 2 && std::string(arguments[1]) == "--help") {
-            std::cout << "bmc-lite [--config FILE] [--rules FILE] [--sel FILE] [--log FILE] [--interval-ms N] [--ticks N] [--gpio VALUE_NODE] [--worker-threads N] [--task-capacity N] [--enable-actions] [--check-config]\n";
-            return 0;
-        }
-        const auto settings = options(count, arguments);
+        settings = bmc::parse_options(tokens);
+    } catch (const std::exception& error) {
+        std::cerr << "bmc-lite: " << error.what() << '\n' << bmc::usage();
+        return 2;
+    }
+    if (settings.help) {
+        std::cout << bmc::usage();
+        return 0;
+    }
+    try {
         if (settings.check_config) {
             bmc::PosixLinuxIo io;
             const auto sensors = bmc::prepare_sensors(settings.config, io);

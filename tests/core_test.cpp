@@ -1,6 +1,7 @@
 #include "bmc/core.hpp"
 #include "bmc/action.hpp"
 #include "bmc/chip.hpp"
+#include "bmc/cli.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -1128,5 +1129,95 @@ TEST(Rules, ReloadRejectsInvalidPolicy) {
     EXPECT_THROW(engine.merge({{"r", "cpu", bmc::State::critical, 0, 1, "increase_fan"}}, {"cpu"}), std::invalid_argument);
     // 合并失败后原有规则仍然可用。
     EXPECT_EQ(engine.evaluate({"cpu", bmc::State::normal, bmc::State::critical, 95, "sample", 1}).size(), 1u);
+}
+TEST(Cli, HelpWinsAnywhereAndIgnoresOtherArguments) {
+    // --help 出现在任意位置都生效，并且优先于其它（甚至非法的）参数。
+    for (const auto& arguments : std::vector<std::vector<std::string>>{
+             {"--help"},
+             {"-h"},
+             {"--config", "a.conf", "--help"},
+             {"--help", "--config", "a.conf"},
+             {"--config", "a.conf", "--bogus", "--help"},
+             {"--help", "positional"}}) {
+        const auto options = bmc::parse_options(arguments);
+        EXPECT_TRUE(options.help) << "arguments: " << arguments.front();
+    }
+    // 只有真正带 --help 才置位。
+    EXPECT_FALSE(bmc::parse_options({"--config", "a.conf"}).help);
+}
+TEST(Cli, BooleansWorkInAnyPosition) {
+    // 旧实现要求布尔开关必须在末尾，否则会被当成前一个选项的取值。
+    const auto options = bmc::parse_options({"--enable-actions", "--config", "a.conf", "--ticks", "5"});
+    EXPECT_TRUE(options.enable_actions);
+    EXPECT_EQ(options.config, "a.conf");
+    EXPECT_EQ(options.ticks, 5u);
+
+    const auto trailing = bmc::parse_options({"--config", "a.conf", "--check-config"});
+    EXPECT_TRUE(trailing.check_config);
+    EXPECT_EQ(trailing.config, "a.conf");
+
+    const auto both = bmc::parse_options({"--check-config", "--enable-actions"});
+    EXPECT_TRUE(both.check_config);
+    EXPECT_TRUE(both.enable_actions);
+}
+TEST(Cli, ParsesEveryValueOptionAndDefaults) {
+    const auto defaults = bmc::parse_options({});
+    EXPECT_EQ(defaults.config, "config/mock.conf");
+    EXPECT_EQ(defaults.rules, "config/rules.conf");
+    EXPECT_EQ(defaults.sel, "var/sel.db");
+    EXPECT_EQ(defaults.log, "var/faults.jsonl");
+    EXPECT_EQ(defaults.interval_ms, 1000u);
+    EXPECT_EQ(defaults.worker_threads, 1u);
+    EXPECT_EQ(defaults.task_capacity, 64u);
+    EXPECT_EQ(defaults.ticks, 0u);
+    EXPECT_TRUE(defaults.gpio.empty());
+    EXPECT_FALSE(defaults.enable_actions);
+    EXPECT_FALSE(defaults.check_config);
+
+    const auto options = bmc::parse_options({"--config", "c", "--rules", "r", "--sel", "s", "--log", "l",
+        "--gpio", "/dev/gpiochip0", "--interval-ms", "20", "--ticks", "40",
+        "--worker-threads", "4", "--task-capacity", "128"});
+    EXPECT_EQ(options.config, "c");
+    EXPECT_EQ(options.rules, "r");
+    EXPECT_EQ(options.sel, "s");
+    EXPECT_EQ(options.log, "l");
+    EXPECT_EQ(options.gpio, "/dev/gpiochip0");
+    EXPECT_EQ(options.interval_ms, 20u);
+    EXPECT_EQ(options.ticks, 40u);
+    EXPECT_EQ(options.worker_threads, 4u);
+    EXPECT_EQ(options.task_capacity, 128u);
+}
+TEST(Cli, SupportsEqualsSyntax) {
+    const auto options = bmc::parse_options({"--config=a.conf", "--interval-ms=20", "--enable-actions"});
+    EXPECT_EQ(options.config, "a.conf");
+    EXPECT_EQ(options.interval_ms, 20u);
+    EXPECT_TRUE(options.enable_actions);
+}
+TEST(Cli, RejectsMalformedArguments) {
+    // 未知选项、缺少取值、非法整数、位置参数都必须报错，而不是静默忽略。
+    EXPECT_THROW(bmc::parse_options({"--bogus"}), std::invalid_argument);
+    EXPECT_THROW(bmc::parse_options({"--config"}), std::invalid_argument);
+    EXPECT_THROW(bmc::parse_options({"--interval-ms"}), std::invalid_argument);
+    EXPECT_THROW(bmc::parse_options({"--interval-ms", "0"}), std::invalid_argument);
+    EXPECT_THROW(bmc::parse_options({"--interval-ms", "-1"}), std::invalid_argument);
+    EXPECT_THROW(bmc::parse_options({"--interval-ms", "abc"}), std::invalid_argument);
+    EXPECT_THROW(bmc::parse_options({"--interval-ms", "1000001"}), std::invalid_argument);
+    EXPECT_THROW(bmc::parse_options({"--interval-ms", "20x"}), std::invalid_argument);
+    EXPECT_THROW(bmc::parse_options({"positional"}), std::invalid_argument);
+    // 报错文本要带上出错的选项名，便于定位。
+    try {
+        bmc::parse_options({"--interval-ms", "abc"});
+        FAIL() << "expected std::invalid_argument";
+    } catch (const std::invalid_argument& error) {
+        EXPECT_NE(std::string(error.what()).find("--interval-ms"), std::string::npos);
+    }
+}
+TEST(Cli, UsageMentionsEverySupportedOption) {
+    const auto text = bmc::usage();
+    for (const auto* option : {"--config", "--rules", "--sel", "--log", "--interval-ms", "--ticks",
+                               "--gpio", "--worker-threads", "--task-capacity", "--enable-actions",
+                               "--check-config", "--help"}) {
+        EXPECT_NE(text.find(option), std::string::npos) << "usage misses " << option;
+    }
 }
 }
