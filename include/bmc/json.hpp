@@ -1,4 +1,6 @@
 #pragma once
+// JSON 写出器：值模型与文本渲染，输出与 tools/bmc_manage.py 的 json.dumps 对齐。
+// 实现见 src/json.cpp。
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -34,8 +36,8 @@ public:
 
     // 生成紧凑但带空格分隔符的 JSON，与 json.dumps(obj) 一致。
     static std::string dump(const Value& value);
-    // 浮点格式化：最短可往返表示，且整数值省略小数部分（123.0 -> "123"）。
-    // 写出 NaN/Infinity 会抛出 std::invalid_argument。
+    // 浮点格式化：最短可往返表示，整数值省略小数部分（123.0 -> "123"），
+    // 指数 >= 16 时保持科学计数法。写出 NaN/Infinity 会抛出 std::invalid_argument。
     static std::string number(double value);
 };
 }

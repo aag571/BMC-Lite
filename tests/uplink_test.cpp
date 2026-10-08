@@ -6,7 +6,16 @@
 #include <fcntl.h>
 #include <cstring>
 
+// Uplink 到汇聚端的连接管理：有界队列丢最旧、部分写续传、指数退避重连、pending connect
+// 的 SO_ERROR 检查与绝对超时、空闲对端断开检测，以及单事件 JSON 行的编码与大小上限。
 namespace {
+// Uplink 用的 SocketIo 替身，围绕"连接状态"而非真实数据面设计：
+//   - socket() 返回真实的 /dev/null 描述符，避免用例泄漏 fd。
+//   - connect()：pending_connect 置 EINPROGRESS，error 非 0 时返回该 errno，用来分离握手与失败。
+//   - writable() 为假表示握手未完成；getsockopt() 回填 error，模拟 SO_ERROR 的读数。
+//   - recv()：eof 为真时返回 0（对端关闭），否则一律 EAGAIN（本用例不消费下行数据）。
+//   - send()：默认每次最多写 7 字节并累积到 output；blocked 让下一次写返回 EAGAIN。
+// 不模拟：真实网络往返、TLS 握手与真实描述符的读写语义。
 class FakeUplinkSocket final : public bmc::SocketIo {
 public:
     int connects = 0, error = 0;
@@ -36,6 +45,7 @@ public:
     }
     int shutdown(int, int) override { return 0; }
 };
+// 构造固定序列号 3 的 service 事件，供队列与编码断言复用。
 bmc::BusEvent event(std::string message) { return {bmc::BusEventType::service, "test", std::move(message), std::nullopt, 3}; }
 }
 TEST(Uplink, BoundedQueueDropsOldestAndResumesPartialWrites) {
@@ -103,6 +113,7 @@ TEST(Uplink, OversizedEventAndInvalidConfigurationAreRejected) {
     for (const auto* flag : {"--uplink-address", "--uplink-port", "--uplink-capacity"})
         EXPECT_NE(bmc::usage().find(flag), std::string::npos);
 }
+// 保活不能只在"有事件要发"时才做：队列为空时也要探测对端关闭（recv 返回 0）。
 TEST(Uplink, IdlePeerDisconnectIsDetectedWithoutNewEvents) {
     FakeUplinkSocket io;
     bmc::Uplink uplink("127.0.0.1", 9000, 2, io);

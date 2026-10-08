@@ -1,4 +1,6 @@
 #pragma once
+// HTTP/1.1 严格子集的解析与限流：硬上限、增量请求解析器、令牌桶。
+// 实现见 src/http.cpp。
 #include "bmc/socket_io.hpp"
 #include <chrono>
 #include <cstddef>
@@ -26,6 +28,7 @@ enum class ParseResult {
     unsupported,  // 语法合法但不支持（如 chunked）
 };
 
+// 一条已完整解析的请求。headers 保持原始顺序，便于逐字回显与审计。
 struct Request {
     std::string method;
     std::string target;

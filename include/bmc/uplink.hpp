@@ -1,9 +1,12 @@
 #pragma once
+// 上行遥测：订阅事件总线、有界队列、非阻塞重连与发送指标。
+// 实现见 src/uplink.cpp。
 #include "bmc/core.hpp"
 #include "bmc/socket_io.hpp"
 #include <atomic>
 
 namespace bmc {
+// 上行队列与传输计数：dropped 同时包含队列溢出与断线时丢弃的在途帧。
 struct UplinkStats {
     std::size_t queued = 0;
     std::uint64_t dropped = 0, sent = 0, bytes = 0, attempts = 0;
@@ -17,10 +20,15 @@ public:
     Uplink(std::string address, unsigned port, std::size_t capacity = 256,
            SocketIo& io = system_socket_io());
     ~Uplink();
+    // 编码为一行 JSONL 并入队；队列满、已停止或单条超过 8 KiB 时返回 false 并计入 dropped，
+    // 绝不阻塞事件总线线程，也不做任何网络 I/O。
     bool enqueue(const BusEvent& event);
+    // 启动网络线程；已启动或已停止时抛出 std::logic_error。
     void start();
+    // 幂等；停止线程并把队列与在途消息计入 dropped。
     void stop() noexcept;
     UplinkStats stats() const;
+    // Prometheus 文本，字段与 UplinkStats 一一对应。
     std::string metrics() const;
     // 单步非阻塞状态机，仅用于未启动线程时的 FakeSocketIo 测试。
     void advance(Clock::time_point now);

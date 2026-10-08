@@ -1,12 +1,14 @@
 # BMC-Lite：从零安装与使用
 
-控制面启用后，令牌、TLS 或绑定配置错误会使进程立即以非零状态退出；运行期监听或审计故障同样触发退出，便于 systemd 重启。SEL 描述符默认使用非阻塞打开，但普通文件的同步落盘仍可能产生磁盘延迟；peer 失联/恢复报告经有界事件总线异步写入，队列满时属于尽力而为。
-
-恢复任务默认使用 2 条 Worker 线程（可用 `--worker-threads` 调整），重试退避总计最多 30ms。一个慢动作仍会占用其中一条线程；本项目不强制取消阻塞的驱动调用。
+Linux C++20 硬件监测与故障恢复服务。采样、去抖/迟滞、规则、线程池、事件总线、日志和 SEL 组成闭环。只读 HTTP、认证控制、上行遥测和实例心跳默认关闭。[验证证据](docs/verification.md)列出各子系统的验证方式，[代码指南](docs/code-guide.md)解释对象和数据流。
 
 [English guide](README.en.md)
 
-Linux C++20 硬件监测与故障恢复简历项目。采样、去抖/迟滞、规则、线程池、事件总线、日志和 SEL 组成闭环。只读 HTTP、认证控制、上行遥测和实例心跳默认关闭。[验收记录](docs/completion.md)列出功能与验证范围，[代码指南](docs/code-guide.md)解释对象和数据流。
+## 0. 运行特性与已知取舍
+
+控制面启用后，令牌、TLS 或绑定配置错误会使进程立即以非零状态退出；运行期监听或审计故障同样触发退出，便于 systemd 重启。SEL 描述符默认使用非阻塞打开，但普通文件的同步落盘仍可能产生磁盘延迟；peer 失联/恢复报告经有界事件总线异步写入，队列满时属于尽力而为。
+
+恢复任务默认使用 2 条 Worker 线程（可用 `--worker-threads` 调整），重试退避总计最多 30ms。一个慢动作仍会占用其中一条线程；不强制取消阻塞的驱动调用。
 
 ## 1. 准备 Linux
 
@@ -44,7 +46,7 @@ ctest --test-dir build --output-on-failure
 
 首次测试构建会下载 GoogleTest 1.15.2；离线运行版可用 `-DBUILD_TESTING=OFF`。已有仓库更新时先保存自己的改动，再 `git pull --ff-only`，重新编译。
 
-测试主体是 C++：`core_test.cpp` 覆盖领域与 FakeLinuxIo，`network/control/uplink/peer_test.cpp` 覆盖网络状态机，`runtime_management_test.cpp` 验证降级和内存状态裁剪，`stress_test.cpp` 验证并发队列。Python 脚本启动真实进程，测试 HTTP/TLS、信号、热加载和故障注入；`linux_io_fake_test.py` 仅是 Python OS 描述符检查，与 C++ Fake 无关。GPIO Fake 返回真实占位 fd，验证线值、失败、CLOEXEC 和关闭；电气行为需实机。
+测试主体是 C++：`core_test.cpp` 覆盖领域与 FakeLinuxIo，`network/control/uplink/peer_test.cpp` 覆盖网络状态机，`runtime_management_test.cpp` 验证降级和内存状态裁剪，`stress_test.cpp` 验证并发队列。Python 脚本启动真实进程，测试 HTTP/TLS、信号、热加载和故障注入。GPIO Fake 返回真实占位 fd，验证线值、失败、CLOEXEC 和关闭；电气行为需实机。
 
 ## 3. 第一次前台运行
 
@@ -175,7 +177,7 @@ healthz 的 samples 持续增加。指标包含记录中的传感器状态/数�
 - [心跳指南](docs/peer.md)：独立认证端口、双向代次、陈旧/恢复和远程证书校验；不选主、不写硬件。
 - [运行可靠性](docs/runtime-reliability.md)：日志降级上报、规则状态裁剪。
 
-多个功能要将参数合并为同一条 ExecStart，保留 config/rules/sel/log。入门演示保持 mock，修改序列为持续 critical，校验并重载，观察规则/恢复/SEL，再恢复正常值。
+多个功能要将参数合并为同一条 ExecStart，保留 config/rules/sel/log。使用 mock 配置时，把序列改为持续 critical，校验并重载，即可观察规则、恢复与 SEL，再恢复正常值。
 
 ## 10. 验证和排错
 
@@ -191,7 +193,7 @@ BMC_TSAN_NO_ASLR=1 bash tools/validate.sh tsan
 bash tools/bench-writes.sh 50000
 ```
 
-ASan/UBSan 与 TSan 用不同目录。setarch 仅改变本次测试进程及子进程，不改全局配置。[验收记录](docs/completion.md)与[性能基准](docs/benchmarks.md)列出实际结果。
+ASan/UBSan 与 TSan 用不同目录。setarch 仅改变本次测试进程及子进程，不改全局配置。[验证证据](docs/verification.md)与[性能基准](docs/benchmarks.md)列出实际结果。
 
 服务失败看 `journalctl -u bmc-lite.service -b`；unavailable 检查路径/权限；GLIBCXX 错误在目标机编译；HTTP 检查是否启用端口；控制检查令牌属主/0640 和证书。网络启动失败继续监控并最终退出 1。
 
@@ -211,4 +213,4 @@ sudo journalctl -u bmc-lite.service -n 30 --no-pager
 
 ## 12. 边界
 
-本项目不是完整 BMC 固件。SEL 是自定义文本，支持批量写、重要记录 fdatasync、尾部修复及压缩后追加；无 CRC、断电事务、多写者协调。日志默认不 fsync。队列和未落盘缓冲有界，任务不支持强制取消。芯片事实未核实处明确标注，实机电气行为需另外验证。选主/fencing、固件 A/B、完整 Redfish/RMCP+、SSE/WebSocket 属于方案未纳入的扩展方向。
+不是完整 BMC 固件。SEL 是自定义文本，支持批量写、重要记录 fdatasync、尾部修复及压缩后追加；无 CRC、断电事务、多写者协调。日志默认不 fsync。队列和未落盘缓冲有界，任务不支持强制取消。芯片事实未核实处明确标注，实机电气行为需另外验证。选主/fencing、固件 A/B、完整 Redfish/RMCP+、SSE/WebSocket 属于未纳入的扩展方向。

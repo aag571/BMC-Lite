@@ -2,7 +2,15 @@
 #include <gtest/gtest.h>
 #include <cerrno>
 #include <cstring>
+
+// HttpConnection 的连接级状态机：部分写遇 EAGAIN 后续写、慢客户端的绝对超时，
+// 以及解析失败时回 400 而不是把连接挂死。时间一律由用例注入 Clock，不依赖真实时长。
 namespace {
+// 极简的 SocketIo 替身：只驱动 HttpConnection 用到的 recv/send 两个方向。
+//   - input：待读取的字节；recv 按需切分返回，读空后置 EAGAIN。
+//   - output：send 累积的字节；每次最多写 7 字节，用来稳定复现部分写路径。
+//   - blocked：把紧接着的一次 send 变成 EAGAIN。
+// 不模拟：真实描述符（其余虚调用一律返回失败或成功占位）、accept/bind/listen 与时间推进。
 class ScriptSocket final : public bmc::SocketIo {
 public:
     std::string input, output;
@@ -27,6 +35,7 @@ public:
         return static_cast<ssize_t>(size);
     }
 };
+// 固定回 200 的处理器桩：让用例只关注连接状态机，不掺入任何路由逻辑。
 bmc::HttpResponse ok(const bmc::http::Request&) { return {200, "OK", "text/plain", "hello"}; }
 }
 TEST(HttpConnection, PartialWritesResumeAfterEagain) {

@@ -3,7 +3,12 @@
 #include <filesystem>
 #include <unistd.h>
 
+// 运行期自监控：日志与 SEL 的降级如何被计数并上报（含 5 秒节流，避免每 tick 刷屏），
+// 以及规则引擎在传感器消失时如何裁剪状态、又如何保留仍在管传感器的确认计数。
 namespace {
+// EventLogger 的替身：不落任何字节，只给出可控的失败/丢弃计数，用来驱动降级上报分支。
+//   - failures/dropped 由用例直接设值，等价于 Logger 内部计数器的读数。
+//   - write()/action() 只累加 writes，便于断言降级路径没有反向写日志形成回馈。
 class HealthLogger final : public bmc::EventLogger {
 public:
     std::uint64_t failures = 0, dropped = 0;
@@ -13,10 +18,12 @@ public:
     std::uint64_t write_failures() const override { return failures; }
     std::uint64_t dropped_bytes() const override { return dropped; }
 };
+// 每个用例独占的文件名，避免并行执行时互相踩踏。
 std::filesystem::path storage(const std::string& suffix) {
     return std::filesystem::temp_directory_path() / ("bmc-runtime-management-" + std::to_string(::getpid()) + suffix);
 }
 }
+// 同一失败在 5 秒窗口内只上报一次；窗口外仍有新失败才再记一条，且上报本身不反写日志。
 TEST(RuntimeManagement, LoggerFailureReportsToSelWithoutFeedbackOrSpam) {
     const auto path = storage("-log.sel");
     std::filesystem::remove(path);
@@ -70,6 +77,7 @@ TEST(RuntimeManagement, DroppedBytesAloneTriggerOneBusNotification) {
     EXPECT_NE(sel.query()[0].message.find("dropped-bytes=10"), std::string::npos);
     std::filesystem::remove(path);
 }
+// SEL 已经写不进去，降级只能靠总线与日志：连续两次 poll 也只上报一次。
 TEST(RuntimeManagement, SelWriteFailureReportsOnce) {
     bmc::SelStore sel("/dev/full");
     sel.append("cpu", "critical", "failure", std::nullopt, true);
@@ -93,6 +101,7 @@ TEST(RuntimeManagement, SelWriteFailureReportsOnce) {
     EXPECT_EQ(received, 1u);
     EXPECT_EQ(logger.writes, 1u);
 }
+// ============ 规则状态裁剪：传感器消失后不得残留 ============
 TEST(RuntimeManagement, DisappearingSensorsDoNotAccumulateRuleStates) {
     bmc::FaultRuleEngine rules({{"fault", "*", bmc::State::critical, 2, 2, "inspect_device"}});
     for (unsigned index = 0; index < 10000; ++index) {

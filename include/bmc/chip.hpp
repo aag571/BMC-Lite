@@ -1,4 +1,6 @@
 #pragma once
+// 芯片层：I2cBus 的 SMBus 访问、ChipDriver 抽象、按型号构造的驱动注册表，
+// 以及各驱动的寄存器解码辅助。实现见 src/chips.cpp。
 #include "bmc/linux_io.hpp"
 #include <cstdint>
 #include <memory>
@@ -39,9 +41,11 @@ struct ChipFeature {
     std::string unit;
 };
 
+// 芯片驱动的统一接口。一个驱动对应一个型号，可提供多个测量量。
 class ChipDriver {
 public:
     virtual ~ChipDriver() = default;
+    // 配置里使用的型号名（backend 写作 "i2c:<name>"），也是注册表的键。
     virtual const char* name() const = 0;
     // 该芯片型号提供的全部测量量，用于报错信息与文档。
     virtual std::vector<ChipFeature> features() const = 0;

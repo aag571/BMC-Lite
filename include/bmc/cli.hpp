@@ -1,4 +1,6 @@
 #pragma once
+// 命令行选项的取值结构与解析入口，供 main 在加载配置之前消费。
+// 实现见 src/cli.cpp。
 #include <string>
 #include <vector>
 

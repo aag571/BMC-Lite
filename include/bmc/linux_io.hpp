@@ -1,4 +1,6 @@
 #pragma once
+// Linux 系统调用的可注入抽象与生产实现，供 I2C/GPIO/PWM 代码复用。
+// 实现见 src/linux_io.cpp。
 #include <cerrno>
 #include <atomic>
 #include <cstdint>

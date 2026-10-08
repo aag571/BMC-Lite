@@ -8,6 +8,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// 控制面的安全边界与行为：令牌文件的权限/符号链接/长度校验、常量时间比较、非回环明文监听
+// 必须在建立套接字前失败，以及 ControlService 的鉴权、限流、路径白名单与审计失败语义。
 TEST(Control, TokenFileRejectsPermissionsAndSymlinks) {
     const auto path = "/tmp/bmc-token-" + std::to_string(::getpid());
     { std::ofstream file(path); file << std::string(40, 'x') << '\n'; }
@@ -74,6 +76,7 @@ TEST(Control, StrictParserRejectsAmbiguousAndUnsupportedHeaders) {
         EXPECT_EQ(parser.feed(std::string("POST / HTTP/1.1\r\n") + headers + "\r\n"), bmc::http::ParseResult::unsupported);
     }
 }
+// ============ ControlService：鉴权、限流、路径白名单与审计 ============
 TEST(Control, AuthenticationRateLimitAndPathRejectionAreAudited) {
     bmc::Worker worker(8, 1);
     bmc::RecoveryPolicyEngine recovery([](const bmc::RecoveryRequest&) { return true; });
@@ -109,6 +112,7 @@ TEST(Control, WorkerUsesConfiguredPathAndRecoveryCooldown) {
     worker.stop();
     EXPECT_EQ(writes.load(), 1u);
 }
+// 审计 "accepted" 写入失败时动作不得入队：顺序是先审计后提交，异常直接上抛。
 TEST(Control, AuditFailureCannotExecuteQueuedAction) {
     bmc::Worker worker(8, 1);
     std::atomic<unsigned> writes{0};
@@ -136,6 +140,7 @@ TEST(Control, AuditFailureCannotExecuteQueuedAction) {
     EXPECT_NE(records[0].find("outcome=requested"), std::string::npos);
     EXPECT_NE(records[1].find("outcome=accepted"), std::string::npos);
 }
+// 完成态审计在 worker 线程里失败：由 service.failed() 与 worker 失败计数暴露，不静默吞掉。
 TEST(Control, CompletionAuditFailureIsVisibleToDaemon) {
     bmc::Worker worker(8, 1);
     bmc::RecoveryPolicyEngine recovery([](const bmc::RecoveryRequest&) { return true; });

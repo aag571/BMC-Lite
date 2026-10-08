@@ -5,6 +5,14 @@
 #include <thread>
 #include <vector>
 
+// 调度与总线的竞态压力验证。它独立成可执行文件（CMake 目标 bmc_stress，CTest 用例
+// scheduler_stress，带 stress 标签），因为它是 TSan / Valgrind 与压力测试的专用入口：
+// 不计时、不依赖 gtest，失败即以非零退出码结束。
+// 断言两条守恒关系：
+//   1. worker 记账守恒：executed == accepted、completed == accepted，结束后
+//      running/queued/failed 全为 0，且 accepted + rejected == 生产者提交总数 80000。
+//   2. 总线守恒：delivered == published，且 published + dropped == 生产者发布总数 40000。
+// 线程数与提交次数写死，是为了让 TSan 下的调度交错可复现。
 int main() {
     bmc::Worker worker(256, 4);
     std::atomic<unsigned> executed = 0;

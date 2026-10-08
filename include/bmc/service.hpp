@@ -1,4 +1,6 @@
 #pragma once
+// 只读 HTTP 服务面：SEL 文件读取、响应渲染，以及与 bmc_manage.py 逐字一致的资源与指标文本。
+// 实现见 src/service.cpp。
 #include "bmc/json.hpp"
 #include <cstdint>
 #include <optional>

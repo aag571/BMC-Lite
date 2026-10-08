@@ -1,4 +1,6 @@
 #pragma once
+// socket 系统调用的可注入抽象、生产实现与地址格式化。
+// 实现见 src/socket_io.cpp。
 #include <cerrno>
 #include <atomic>
 #include <poll.h>
@@ -60,6 +62,8 @@ public:
 // 进程级默认实例：无状态，供不关心注入的调用点与既有测试使用。
 SocketIo& system_socket_io();
 
-// 把 sockaddr 格式化成 "ip:port"；解析失败时返回空串。用于审计与限流键。
+// 把 sockaddr 格式化成地址串：IPv4 为 "ip:port"，IPv6 为 "[ip]:port"；无法识别的协议族或
+// 转换失败返回空串。生产路径不使用它：限流键是 network.cpp 中只含 IP 的文本，
+// 这样重连换源端口无法绕过限流；本函数保留给诊断与测试。
 std::string peer_name(const sockaddr* address, socklen_t length);
 }

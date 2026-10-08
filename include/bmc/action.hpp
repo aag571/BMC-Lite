@@ -1,4 +1,6 @@
 #pragma once
+// 恢复动作接口与两个实现：模拟动作与 PWM 写入动作，二者都不持有传感器状态。
+// 实现见 src/actions.cpp。
 #include "bmc/core.hpp"
 #include "bmc/linux_io.hpp"
 
@@ -9,7 +11,7 @@ public:
     virtual ~Action() = default;
     virtual bool execute(const RecoveryRequest& request) = 0;
 };
-// 模拟动作不访问硬件，便于虚拟机演示和故障策略单元测试。
+// 模拟动作不访问硬件，用于无硬件环境与故障策略单元测试。
 class LogOnlyAction final : public Action {
 public:
     bool execute(const RecoveryRequest& request) override {

@@ -1,10 +1,14 @@
 # BMC-Lite — Installation and User Guide
 
-With control enabled, invalid token, TLS or bind settings make the daemon exit immediately with a nonzero status. Runtime listener or audit failures also exit so systemd can restart it. SEL opens its descriptor nonblocking, although regular-file fdatasync can still incur disk latency. Peer stale/recovered reports enter the bounded event bus and are best effort if its queue is full.
-
-Recovery tasks use two Worker threads by default (configurable with `--worker-threads`), and total retry backoff is capped at 30 ms. A slow action still occupies one thread; this project does not forcibly cancel a blocked driver call.
+BMC-Lite is a Linux C++20 hardware monitoring and fault-recovery service. The daemon samples devices, confirms fault states, evaluates rules, schedules recovery tasks, and writes JSONL logs and persistent events. A separate Python utility provides read-only HTTP resources and Prometheus metrics.
 
 [中文手册](README.md)
+
+## 0. Operating characteristics and known trade-offs
+
+With control enabled, invalid token, TLS or bind settings make the daemon exit immediately with a nonzero status. Runtime listener or audit failures also exit so systemd can restart it. SEL opens its descriptor nonblocking, although regular-file fdatasync can still incur disk latency. Peer stale/recovered reports enter the bounded event bus and are best effort if its queue is full.
+
+Recovery tasks use two Worker threads by default (configurable with `--worker-threads`), and total retry backoff is capped at 30 ms. A slow action still occupies one thread; a blocked driver call is not forcibly cancelled.
 
 The daemon includes optional read-only HTTP and control services, disabled by default. See the [control guide](docs/control.en.md) for TLS builds, release installation, credentials, systemd setup, requests and auditing.
 
@@ -12,9 +16,7 @@ Optional uplink telemetry provides a bounded queue, nonblocking TCP, reconnectio
 
 See [runtime reliability](docs/runtime-reliability.en.md) for logger degradation reporting, rule state cleanup and hardware verification limits.
 
-Authenticated peer heartbeats exchange configuration generations and report stale/recovered peers through a separate port. See the [peer guide](docs/peer.en.md) and [acceptance record](docs/completion.md).
-
-BMC-Lite is a Linux C++20 hardware monitoring resume project. The daemon samples devices, confirms fault states, evaluates rules, schedules recovery tasks, and writes JSONL logs and persistent events. A separate Python utility provides read-only HTTP resources and Prometheus metrics.
+Authenticated peer heartbeats exchange configuration generations and report stale/recovered peers through a separate port. See the [peer guide](docs/peer.en.md) and [verification evidence](docs/verification.md).
 
 ## 1. Choose your installation path
 
@@ -65,7 +67,6 @@ The first test build downloads GoogleTest 1.15.2. An offline production build ca
 | `tests/runtime_test.py` | Python | Process startup, SIGHUP reload, invalid configuration, SIGTERM |
 | `tests/fault_injection_test.py` | Python | Daemon behavior with missing inputs and failed writes |
 | `tests/metrics_test.py` | Python | Python management-tool formatting |
-| `tests/linux_io_fake_test.py` | Python | Basic OS file-descriptor checks; unrelated to the C++ `FakeLinuxIo` |
 
 Run C++ tests independently:
 
@@ -75,7 +76,7 @@ Run C++ tests independently:
 ./build/bmc_stress
 ```
 
-`LinuxIo` is the injected syscall interface. C++ FakeLinuxIo covers I2C replies, PWM writes, GPIO values and failures. For GPIO it supplies an owned real placeholder descriptor, so CLOEXEC and closure are also tested. Electrical behavior requires hardware. Python `linux_io_fake_test.py` is unrelated to this C++ fake.
+`LinuxIo` is the injected syscall interface. C++ FakeLinuxIo covers I2C replies, PWM writes, GPIO values and failures. For GPIO it supplies an owned real placeholder descriptor, so CLOEXEC and closure are also tested. Electrical behavior requires hardware.
 
 ## 4. First foreground run
 
@@ -247,4 +248,4 @@ BMC_TSAN_NO_ASLR=1 bash tools/validate.sh tsan
 bash tools/bench-writes.sh 50000
 ```
 
-This is an educational resume project, not complete BMC firmware. SEL is a custom text format without CRC or power-loss atomicity guarantees: startup repairs a torn trailing record by truncating it and reports the discarded byte count, but a bit flip in the middle of the file is not detectable. Both the log and the SEL batch their writes through a persistent descriptor; neither terminates the daemon on a write failure. The log does not fsync by default (pass `sync = true` to the Logger constructor for per-record durability) and flushes its buffer into the current segment before rotating, while the SEL writes state transitions and recovery outcomes immediately with fdatasync. Real I2C/GPIO electrical behavior needs hardware or an appropriate QEMU model. Python OS descriptor tests are not mocked C++ ioctl tests. See `docs/code-guide.md` for the source reading order.
+This is not complete BMC firmware. SEL is a custom text format without CRC or power-loss atomicity guarantees: startup repairs a torn trailing record by truncating it and reports the discarded byte count, but a bit flip in the middle of the file is not detectable. Both the log and the SEL batch their writes through a persistent descriptor; neither terminates the daemon on a write failure. The log does not fsync by default (pass `sync = true` to the Logger constructor for per-record durability) and flushes its buffer into the current segment before rotating, while the SEL writes state transitions and recovery outcomes immediately with fdatasync. Real I2C/GPIO electrical behavior needs hardware or an appropriate QEMU model. See `docs/code-guide.md` for the source reading order.

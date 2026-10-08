@@ -4,7 +4,15 @@
 #include <cstring>
 #include <fcntl.h>
 
+// 对端心跳：带鉴权与代次（generation）的心跳应答、stale/recovered 各自只上报一次、
+// 部分写与 EAGAIN 续传、pending connect 的绝对超时与重试间隔，以及明文远程/不完整 TLS 的拒绝。
 namespace {
+// 心跳链路用的 SocketIo 替身：
+//   - input：待 recv 的字节；读空且 eof 为假时返回 EAGAIN。
+//   - output：send 累积内容，每次最多 7 字节，用于逼出部分写；block 让下一次写返回 EAGAIN。
+//   - pending：connect 返回 EINPROGRESS 且 writable() 为假，用于验证握手超时与重试间隔。
+//   - connects：统计发起过几次 connect。
+// 不模拟：真实描述符语义、真实网络与 TLS 握手；getsockopt 恒回填 0（即无 SO_ERROR）。
 class PeerSocket final : public bmc::SocketIo {
 public:
     std::string input, output;
@@ -30,6 +38,7 @@ public:
         std::memcpy(data, input.data(), size); input.erase(0, size); return static_cast<ssize_t>(size);
     }
 };
+// 构造一条带鉴权头与代次头的心跳请求；token 可替换以覆盖鉴权失败路径。
 bmc::http::Request heartbeat(std::string token = std::string(48, 'x')) {
     return {"GET", "/v1/heartbeat", "HTTP/1.1", {{"Authorization", "Bearer " + token}, {"X-BMC-Generation", "7"}}, {}};
 }
@@ -59,6 +68,7 @@ TEST(PeerHeartbeat, StaleTransitionAndRecoveryAreReportedOnce) {
     peer.handle(heartbeat(), "127.0.0.1");
     ASSERT_EQ(reports.size(), 2u); EXPECT_NE(reports[1].find("recovered"), std::string::npos);
 }
+// 对端回超长内容时按一次失败计数，已解析出的代次保持上一次的值而不被污染。
 TEST(PeerHeartbeat, PartialWriteEagainAndBoundedResponse) {
     PeerSocket io;
     io.input = bmc::HttpResponse{200, "OK", "text/plain", "9\n"}.render();

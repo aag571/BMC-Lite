@@ -1,4 +1,6 @@
 #pragma once
+// 对等通道：主动心跳、失效判定、代次交换与心跳端点服务。
+// 实现见 src/peer.cpp。
 #include "bmc/network.hpp"
 #include <mutex>
 
@@ -13,12 +15,18 @@ public:
                   Report report, std::string ca = {}, std::string server_name = {},
                   SocketIo& io = system_socket_io());
     ~PeerHeartbeat();
+    // 启动后台线程；与 stop() 配合，同一实例不可重复 start。
     void start();
+    // 幂等：停线程、释放 TLS 会话并关闭描述符。
     void stop() noexcept;
+    // 更新本端对外的代次号，下一次心跳即携带新值。
     void generation(std::uint64_t value);
+    // 服务入站心跳：校验 Bearer 令牌与 /v1/heartbeat 形态后回本端代次，
+    // 鉴权失败按来源限流并返回 401/429。可在网络线程外调用，内部加锁。
     HttpResponse handle(const http::Request& request, const std::string& source);
     // 单步驱动可由 FakeSocketIo 和虚拟时间验证，无需真实 socket 或睡眠。
     void advance(Clock::time_point now);
+    // Prometheus 文本：失效标志、对端代次、心跳与失败计数。
     std::string metrics() const;
 private:
     void observe(std::uint64_t value, Clock::time_point now);
