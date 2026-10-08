@@ -241,13 +241,14 @@ std::uint64_t SelStore::append(const std::string& source, const std::string& sta
     const auto time = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     records_.push_back({id, time, source, state, message, value});
-    trim();
+    if (records_.size() > max_records_) {
+        trim();
+    }
     if (policy_ != Truncate::prepare) {
         pending_ += encode(SelRecord{id, time, source, state, message, value});
         if (important || pending_.size() >= batch_bytes_) {
             drain(true);
         }
-        // 持续写失败时不能无限占用内存：丢弃最旧的未落盘内容并计数。
         if (pending_.size() > pending_cap_) {
             drop_oldest(pending_.size() - pending_cap_);
         }
