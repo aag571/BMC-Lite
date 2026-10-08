@@ -13,7 +13,7 @@
 
 // chips.cpp —— I2C/SMBus 总线封装与专用芯片驱动（接口声明在 bmc/chip.hpp）。
 // 本文件只负责寄存器语义与换算；系统调用全部经注入的 LinuxIo，使解码逻辑可在 FakeLinuxIo 下单测。
-// 凡未与发布版数据手册逐项核对的常量都在此标注“未核实”，依据见 docs/chips.md。
+// 凡未与发布版数据手册逐项核对的常量都在此标注“未核实”，依据见 docs/芯片驱动与标定.md。
 namespace bmc {
 namespace {
 // 把当前 errno 转成异常：必须在失败的系统调用之后立刻调用，中间不能插入可能改写 errno 的操作。
@@ -145,7 +145,7 @@ namespace {
 // 温度寄存器 0x00，16 位、高字节在前的二进制补码。LM75A/B 低字节的 bit7..bit5 是 0.125 ℃ 位，
 // 因此 11 位分辨率下 LSB = 0.125 ℃。原始 LM75 只有 0.5 ℃ 分辨率，低字节为 0。
 // 家族内分辨率并不统一：构造参数 high_resolution 选 false 走 9 位、选 true 走 11 位，
-// 型号名随之不同；哪个具体型号属于哪种分辨率未核实（见 docs/chips.md）。
+// 型号名随之不同；哪个具体型号属于哪种分辨率未核实（见 docs/芯片驱动与标定.md）。
 // 读取只用 read_word 一次完整事务，不用两次单字节读，以免触发 LM75A 单字节读把 SDA 拉低的已知陷阱。
 class Lm75Driver final : public ChipDriver {
 public:
@@ -259,7 +259,7 @@ public:
         return {{"rpm", "RPM"}, {"temp", "C"}, {"temp_external", "C"}};
     }
     // 每次调用只读一种测量量。转速的高低字节分两次字节读，手册未记录影子/锁存寄存器，
-    // 因此两次读之间数值可能变化，本实现不声称原子性（见 docs/chips.md 未核实项）。
+    // 因此两次读之间数值可能变化，本实现不声称原子性（见 docs/芯片驱动与标定.md 未核实项）。
     std::optional<double> read(const std::string& feature) override {
         if (same_feature(feature, "rpm")) {
             const auto high = bus_.read_byte(kTachHigh);
@@ -403,7 +403,7 @@ private:
     static constexpr std::uint8_t kPower = 0x03;
     static constexpr std::uint8_t kCurrent = 0x04;
     static constexpr std::uint8_t kCalibration = 0x05;
-    // 以下 LSB、校准系数与功率系数均未核实（SBOS448G/SBOS547C 的具体章节未记录，见 docs/chips.md）。
+    // 以下 LSB、校准系数与功率系数均未核实（SBOS448G/SBOS547C 的具体章节未记录，见 docs/芯片驱动与标定.md）。
     static constexpr double kIna219CalFactor = 0.04096;
     static constexpr double kIna219ShuntLsbVolts = 1e-5;
     static constexpr double kIna219BusLsbVolts = 0.004;

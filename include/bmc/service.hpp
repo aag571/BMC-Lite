@@ -29,7 +29,7 @@ struct HttpResponse {
     std::string content_type;
     std::string body;
 
-    // 按 docs/tcp.md 的协议子集渲染：始终带 Content-Length、Cache-Control: no-store。
+    // 按 docs/网络设计说明.md 的协议子集渲染：始终带 Content-Length、Cache-Control: no-store。
     std::string render() const;
 };
 

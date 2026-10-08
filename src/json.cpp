@@ -37,7 +37,7 @@ void escape_into(const std::string& text, std::string& output) {
     }
     output += '"';
 }
-// 判断一段十进制文本能否被精确解析回原值：这是"最短可往返表示"的验收条件。
+// 判断一段十进制文本能否被精确解析回原值：这是"最短可往返表示"的判定标准。
 bool parses_back_to(const char* text, double value) {
     double parsed = 0;
     const auto* end = text + std::strlen(text);

@@ -3,7 +3,7 @@ fan_rpm sysfs /sys/class/hwmon/hwmon1/fan1_input 1 low 1500 500 100 3 3 -
 i2c_word i2c /dev/i2c-1,0x48,0x00 1 high 70 90 3 3 3 -
 
 # Dedicated chip drivers: backend is i2c:<chip>[@<feature>], path is device,address.
-# Register semantics and datasheet references: docs/chips.md
+# Register semantics and datasheet references: docs/芯片驱动与标定.md
 # i2c_lm75 i2c:lm75b /dev/i2c-1,0x48 1 high 70 90 3 3 3 -
 # fan_rpm i2c:emc2103@rpm /dev/i2c-1,0x2E 1 low 500 200 20 3 3 /sys/class/hwmon/hwmon1/pwm1
 # vout i2c:adm1275@vout /dev/i2c-1,0x10 1 high 12 13 0.5 3 3 -

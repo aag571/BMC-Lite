@@ -1,6 +1,6 @@
 # BMC-Lite：从零安装与使用
 
-Linux C++20 硬件监测与故障恢复服务。采样、去抖/迟滞、规则、线程池、事件总线、日志和 SEL 组成闭环。只读 HTTP、认证控制、上行遥测和实例心跳默认关闭。[验证证据](docs/verification.md)列出各子系统的验证方式，[代码指南](docs/code-guide.md)解释对象和数据流。
+Linux C++20 硬件监测与故障恢复服务。采样、去抖/迟滞、规则、线程池、事件总线、日志和 SEL 组成闭环。只读 HTTP、认证控制、上行遥测和实例心跳默认关闭。[验证与测试报告](docs/验证与测试报告.md)列出验证方式，[代码阅读指南](docs/代码阅读指南.md)解释对象和数据流。
 
 [English guide](README.en.md)
 
@@ -145,7 +145,7 @@ gpio_fault gpio /dev/gpiochip0,23,active-low 1 high 0.5 1 0 1 1 -
 
 规则格式：`id sensor state confirmations clear_confirmations action`。状态 warning/critical/unavailable，动作 increase_fan/inspect_device；`*` 各传感器独立计数，按每次采样确认。inspect 只记录检查请求。
 
-GPIO v2 后端轮询线值；`--gpio` 是独立的旧 sysfs 边沿入口。I2C 专用型号和未核实项见 [芯片说明](docs/chips.md)。hwmon 编号可能变化；实机需要设备权限。systemd 默认禁止 sysfs 写入，真实 PWM 需为具体配置节点加 `ReadWritePaths` 并启用 `--enable-actions`，见 [控制指南](docs/control.md)。
+GPIO v2 后端轮询线值；`--gpio` 是独立的旧 sysfs 边沿入口。I2C 专用型号和未核实项见 [芯片说明](docs/芯片驱动与标定.md)。hwmon 编号可能变化；实机需要设备权限。systemd 默认禁止 sysfs 写入，真实 PWM 需为具体配置节点加 `ReadWritePaths` 并启用 `--enable-actions`，见 [控制指南](docs/控制面部署与使用.md)。
 
 ## 8. 启用 daemon HTTP
 
@@ -172,10 +172,10 @@ healthz 的 samples 持续增加。指标包含记录中的传感器状态/数�
 
 ## 9. 更多功能与操作
 
-- [控制指南](docs/control.md)：0640 令牌、TLS、systemd、curl 和 SEL 审计。202 只表示排队，执行结果查审计。
-- [上行指南](docs/uplink.md)：JSONL 采集、有界队列、重连和指标；无 ACK/持久重放，满时丢最旧。
-- [心跳指南](docs/peer.md)：独立认证端口、双向代次、陈旧/恢复和远程证书校验；不选主、不写硬件。
-- [运行可靠性](docs/runtime-reliability.md)：日志降级上报、规则状态裁剪。
+- [控制面部署与使用](docs/控制面部署与使用.md)：0640 令牌、TLS、systemd、curl 和 SEL 审计。202 只表示排队，执行结果查审计。
+- [上行遥测部署与使用](docs/上行遥测部署与使用.md)：JSONL 采集、有界队列、重连和指标；无 ACK/持久重放，满时丢最旧。
+- [实例心跳部署与使用](docs/实例心跳部署与使用.md)：独立认证端口、双向代次、陈旧/恢复和远程证书校验；不选主、不写硬件。
+- [运行时可靠性说明](docs/运行时可靠性说明.md)：日志降级上报、规则状态裁剪。
 
 多个功能要将参数合并为同一条 ExecStart，保留 config/rules/sel/log。使用 mock 配置时，把序列改为持续 critical，校验并重载，即可观察规则、恢复与 SEL，再恢复正常值。
 
@@ -193,7 +193,7 @@ BMC_TSAN_NO_ASLR=1 bash tools/validate.sh tsan
 bash tools/bench-writes.sh 50000
 ```
 
-ASan/UBSan 与 TSan 用不同目录。setarch 仅改变本次测试进程及子进程，不改全局配置。[验证证据](docs/verification.md)与[性能基准](docs/benchmarks.md)列出实际结果。
+ASan/UBSan 与 TSan 用不同目录。setarch 仅改变本次测试进程及子进程，不改全局配置。[验证证据](docs/验证与测试报告.md)与[性能基准](docs/写入路径性能基准.md)列出实际结果。
 
 服务失败看 `journalctl -u bmc-lite.service -b`；unavailable 检查路径/权限；GLIBCXX 错误在目标机编译；HTTP 检查是否启用端口；控制检查令牌属主/0640 和证书。网络启动失败继续监控并最终退出 1。
 

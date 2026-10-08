@@ -66,4 +66,4 @@ systemctl daemon-reload
 echo "Installed to $prefix with simulation as the initial configuration."
 echo "Start with: sudo systemctl enable --now bmc-lite.service"
 echo "Review the hardware template and device permissions before using hardware."
-echo "Control is disabled by default. See docs/control.md or docs/control.en.md for HTTPS setup."
+echo "Control is disabled by default. See docs/控制面部署与使用.md or docs/控制面部署与使用（英文）.md for HTTPS setup."

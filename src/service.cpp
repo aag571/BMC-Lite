@@ -180,7 +180,7 @@ std::vector<SelEntry> read_sel_entries(const std::string& path, std::size_t max_
 }
 
 // 渲染完整的 HTTP/1.1 响应。body 在返回前就已构建完毕，因此 Content-Length 恒存在；
-// Cache-Control: no-store 与 Connection: close 也是协议子集里固定的一部分（见 docs/tcp.md）。
+// Cache-Control: no-store 与 Connection: close 也是协议子集里固定的一部分（见 docs/网络设计说明.md）。
 std::string HttpResponse::render() const {
     const auto status_text = reason.empty() ? std::to_string(status) : std::to_string(status) + " " + reason;
     std::ostringstream output;

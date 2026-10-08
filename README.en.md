@@ -10,13 +10,13 @@ With control enabled, invalid token, TLS or bind settings make the daemon exit i
 
 Recovery tasks use two Worker threads by default (configurable with `--worker-threads`), and total retry backoff is capped at 30 ms. A slow action still occupies one thread; a blocked driver call is not forcibly cancelled.
 
-The daemon includes optional read-only HTTP and control services, disabled by default. See the [control guide](docs/control.en.md) for TLS builds, release installation, credentials, systemd setup, requests and auditing.
+The daemon includes optional read-only HTTP and control services, disabled by default. See the [control guide](docs/控制面部署与使用（英文）.md) for TLS builds, release installation, credentials, systemd setup, requests and auditing.
 
-Optional uplink telemetry provides a bounded queue, nonblocking TCP, reconnection and metrics. See the [uplink deployment and protocol guide](docs/uplink.en.md).
+Optional uplink telemetry provides a bounded queue, nonblocking TCP, reconnection and metrics. See the [uplink deployment and protocol guide](docs/上行遥测部署与使用（英文）.md).
 
-See [runtime reliability](docs/runtime-reliability.en.md) for logger degradation reporting, rule state cleanup and hardware verification limits.
+See [runtime reliability](docs/运行时可靠性说明（英文）.md) for logger degradation reporting, rule state cleanup and hardware verification limits.
 
-Authenticated peer heartbeats exchange configuration generations and report stale/recovered peers through a separate port. See the [peer guide](docs/peer.en.md) and [verification evidence](docs/verification.md).
+Authenticated peer heartbeats exchange configuration generations and report stale/recovered peers through a separate port. See the [peer guide](docs/实例心跳部署与使用（英文）.md) and [verification evidence](docs/验证与测试报告.md).
 
 ## 1. Choose your installation path
 
@@ -248,4 +248,4 @@ BMC_TSAN_NO_ASLR=1 bash tools/validate.sh tsan
 bash tools/bench-writes.sh 50000
 ```
 
-This is not complete BMC firmware. SEL is a custom text format without CRC or power-loss atomicity guarantees: startup repairs a torn trailing record by truncating it and reports the discarded byte count, but a bit flip in the middle of the file is not detectable. Both the log and the SEL batch their writes through a persistent descriptor; neither terminates the daemon on a write failure. The log does not fsync by default (pass `sync = true` to the Logger constructor for per-record durability) and flushes its buffer into the current segment before rotating, while the SEL writes state transitions and recovery outcomes immediately with fdatasync. Real I2C/GPIO electrical behavior needs hardware or an appropriate QEMU model. See `docs/code-guide.md` for the source reading order.
+This is not complete BMC firmware. SEL is a custom text format without CRC or power-loss atomicity guarantees: startup repairs a torn trailing record by truncating it and reports the discarded byte count, but a bit flip in the middle of the file is not detectable. Both the log and the SEL batch their writes through a persistent descriptor; neither terminates the daemon on a write failure. The log does not fsync by default (pass `sync = true` to the Logger constructor for per-record durability) and flushes its buffer into the current segment before rotating, while the SEL writes state transitions and recovery outcomes immediately with fdatasync. Real I2C/GPIO electrical behavior needs hardware or an appropriate QEMU model. See `docs/代码阅读指南.md` for the source reading order.
