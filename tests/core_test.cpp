@@ -2,7 +2,10 @@
 #include "bmc/action.hpp"
 #include "bmc/chip.hpp"
 #include "bmc/cli.hpp"
+#include "bmc/http.hpp"
+#include "bmc/socket_io.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cmath>
@@ -10,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <gtest/gtest.h>
 #include <limits>
 #include <linux/gpio.h>
@@ -22,7 +26,10 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <netinet/in.h>
 #include <string>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 #include <vector>
 
@@ -1219,5 +1226,438 @@ TEST(Cli, UsageMentionsEverySupportedOption) {
                                "--check-config", "--help"}) {
         EXPECT_NE(text.find(option), std::string::npos) << "usage misses " << option;
     }
+}
+
+// ---- TCP 组件的可测地基：socket 抽象、HTTP 严格子集解析、限流 ----
+
+// 脚本化的 SocketIo：让连接状态机、解析与限流都能在没有真实端口的情况下测试。
+class FakeSocketIo final : public bmc::SocketIo {
+public:
+    struct Reply {
+        int result = 0;        // 返回值；负值表示失败
+        int error = 0;         // 失败时的 errno
+        std::string payload;   // recv 的载荷；每次调用消费一段
+        bool consume_once = false;  // true 时该载荷只返回一次
+    };
+
+    int socket(int domain, int type, int protocol) override {
+        socket_calls.push_back({domain, type, protocol});
+        if (socket_results.empty()) {
+            last_error = 0;
+            return next_descriptor_++;
+        }
+        const auto result = socket_results.front();
+        socket_results.erase(socket_results.begin());
+        last_error = result < 0 ? pending_error : 0;
+        return result;
+    }
+    int bind(int descriptor, const sockaddr* address, socklen_t length) override {
+        bind_calls.push_back(descriptor);
+        if (!address) {
+            bound_names.emplace_back();
+        } else {
+            bound_names.push_back(bmc::peer_name(address, length));
+        }
+        return take(&bind_results);
+    }
+    int listen(int descriptor, int backlog) override {
+        listen_calls.push_back({descriptor, backlog});
+        return take(&listen_results);
+    }
+    int accept(int descriptor, sockaddr* address, socklen_t* length) override {
+        accept_calls.push_back(descriptor);
+        if (accept_results.empty()) {
+            last_error = EAGAIN;
+            return -1;
+        }
+        const auto result = accept_results.front();
+        accept_results.erase(accept_results.begin());
+        if (result < 0) {
+            last_error = EAGAIN;
+        } else if (address != nullptr && length != nullptr &&
+                   *length >= static_cast<socklen_t>(sizeof(sockaddr_in))) {
+            sockaddr_in peer {};
+            peer.sin_family = AF_INET;
+            peer.sin_port = htons(static_cast<std::uint16_t>(40000 + result));
+            peer.sin_addr.s_addr = htonl(0x7f000001u);
+            std::memcpy(address, &peer, sizeof(peer));
+            *length = sizeof(peer);
+            last_error = 0;
+        } else {
+            last_error = 0;
+        }
+        return result;
+    }
+    int setsockopt(int descriptor, int level, int name, const void* value, socklen_t length) override {
+        setsockopt_calls.push_back({descriptor, level, name});
+        (void)value;
+        (void)length;
+        return take(&setsockopt_results);
+    }
+    int getsockopt(int descriptor, int level, int name, void* value, socklen_t* length) override {
+        (void)value;
+        (void)length;
+        (void)descriptor;
+        (void)level;
+        (void)name;
+        return take(&getsockopt_results);
+    }
+    ssize_t recv(int descriptor, void* buffer, std::size_t count, int flags) override {
+        (void)flags;
+        recv_calls.push_back(descriptor);
+        if (incoming.empty()) {
+            last_error = EAGAIN;
+            return -1;
+        }
+        // 支持显式分片：每个元素按自身长度返回，便于构造半包与粘包。
+        auto chunk = incoming.front();
+        incoming.erase(incoming.begin());
+        const auto size = std::min(count, chunk.size());
+        std::memcpy(buffer, chunk.data(), size);
+        const bool partial = size < chunk.size();
+        if (partial) {
+            incoming.insert(incoming.begin(), chunk.substr(size));
+            last_error = 0;
+            return static_cast<ssize_t>(size);
+        }
+        last_error = 0;
+        return static_cast<ssize_t>(size);
+    }
+    ssize_t send(int descriptor, const void* buffer, std::size_t count, int flags) override {
+        (void)flags;
+        send_calls.push_back(descriptor);
+        if (!send_results.empty()) {
+            const auto result = send_results.front();
+            send_results.erase(send_results.begin());
+            last_error = result < 0 ? EPIPE : 0;
+            return result;
+        }
+        sent.append(static_cast<const char*>(buffer), count);
+        last_error = 0;
+        return static_cast<ssize_t>(count);
+    }
+    int shutdown(int descriptor, int how) override {
+        shutdown_calls.push_back({descriptor, how});
+        return take(&shutdown_results);
+    }
+
+    // 队列化返回值；空队列时取默认值。
+    std::vector<int> socket_results;
+    std::vector<int> bind_results;
+    std::vector<int> listen_results;
+    std::vector<int> accept_results;
+    std::vector<int> setsockopt_results;
+    std::vector<int> getsockopt_results;
+    std::vector<int> shutdown_results;
+    std::vector<ssize_t> send_results;
+    std::deque<std::string> incoming;
+    int pending_error = EINVAL;
+
+    std::vector<std::array<int, 3>> socket_calls;
+    std::vector<int> bind_calls;
+    std::vector<std::string> bound_names;
+    std::vector<std::array<int, 2>> listen_calls;
+    std::vector<int> accept_calls;
+    std::vector<std::array<int, 3>> setsockopt_calls;
+    std::vector<int> recv_calls;
+    std::vector<int> send_calls;
+    std::vector<std::array<int, 2>> shutdown_calls;
+    std::string sent;
+
+private:
+    int take(std::vector<int>* queue) {
+        if (queue->empty()) {
+            last_error = 0;
+            return 0;
+        }
+        const auto result = queue->front();
+        queue->erase(queue->begin());
+        last_error = result < 0 ? pending_error : 0;
+        return result;
+    }
+    int next_descriptor_ = 100;
+};
+
+TEST(SocketIo, PosixImplementationMatchesSystemCalls) {
+    // 用一个真实但立即关闭的 UDP 套接字验证直通实现，不依赖网络可用性。
+    bmc::PosixSocketIo io;
+    const int descriptor = io.socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(descriptor, 0) << "socket failed: " << io.last_error;
+    // bind 到回环的临时端口。
+    sockaddr_in address {};
+    address.sin_family = AF_INET;
+    address.sin_port = 0;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    EXPECT_EQ(io.bind(descriptor, reinterpret_cast<const sockaddr*>(&address), sizeof(address)), 0);
+    // 不支持的 option 应返回 -1 并留下 errno。
+    EXPECT_EQ(io.getsockopt(descriptor, SOL_SOCKET, SO_TYPE, &address, nullptr), -1);
+    EXPECT_NE(io.last_error, 0);
+    EXPECT_EQ(io.close(descriptor), 0);
+}
+
+TEST(SocketIo, PeerNameFormatsIpv4AndRejectsOthers) {
+    sockaddr_in ipv4 {};
+    ipv4.sin_family = AF_INET;
+    ipv4.sin_port = htons(8080);
+    ipv4.sin_addr.s_addr = htonl(0x0a000001u);  // 10.0.0.1
+    EXPECT_EQ(bmc::peer_name(reinterpret_cast<const sockaddr*>(&ipv4), sizeof(ipv4)), "10.0.0.1:8080");
+    // 长度不足或族不支持时返回空串，而不是读越界。
+    // 长度不足以容纳 sockaddr_in 时返回空串，而不是读越界。
+    EXPECT_EQ(bmc::peer_name(reinterpret_cast<const sockaddr*>(&ipv4), sizeof(sockaddr)), "");
+    EXPECT_EQ(bmc::peer_name(nullptr, 0), "");
+    sockaddr_un unsupported {};
+    unsupported.sun_family = AF_UNIX;
+    EXPECT_EQ(bmc::peer_name(reinterpret_cast<const sockaddr*>(&unsupported), sizeof(unsupported)), "");
+}
+
+TEST(SocketIo, FakeDrivesAcceptRecvAndSendWithoutRealPorts) {
+    FakeSocketIo io;
+    const int listener = io.socket(AF_INET, SOCK_STREAM, 0);
+    EXPECT_EQ(listener, 100);
+    EXPECT_EQ(io.socket_calls.size(), 1u);
+    io.accept_results = {7, -1};  // 先接受一个连接，再返回"无更多连接"
+    sockaddr_storage peer {};
+    socklen_t length = sizeof(peer);
+    EXPECT_EQ(io.accept(listener, reinterpret_cast<sockaddr*>(&peer), &length), 7);
+    EXPECT_EQ(io.accept(listener, nullptr, nullptr), -1);
+    EXPECT_EQ(io.last_error, EAGAIN);    // recv 支持分片：先给一个半包，再给剩下部分。
+    io.incoming = {"GET /a HTTP/1.1\r\nHost: x\r\n", "\r\n"};
+    char buffer[64] = {};
+    EXPECT_GT(io.recv(7, buffer, sizeof(buffer), 0), 0);
+    EXPECT_GT(io.recv(7, buffer, sizeof(buffer), 0), 0);
+    EXPECT_EQ(io.recv(7, buffer, sizeof(buffer), 0), -1);
+    // send 默认整包成功，也可脚本化为部分写入或 EPIPE。
+    EXPECT_EQ(io.send(7, "abc", 3, 0), 3);
+    EXPECT_EQ(io.sent, "abc");
+    io.send_results = {1, -1};
+    EXPECT_EQ(io.send(7, "abc", 3, 0), 1);
+    EXPECT_EQ(io.send(7, "abc", 3, 0), -1);
+    EXPECT_EQ(io.last_error, EPIPE);
+    EXPECT_EQ(io.shutdown(7, SHUT_RDWR), 0);
+    ASSERT_EQ(io.shutdown_calls.size(), 1u);
+    EXPECT_EQ(io.shutdown_calls.front()[0], 7);
+    EXPECT_EQ(io.shutdown_calls.front()[1], SHUT_RDWR);
+    // close() is the real ::close (non-virtual), so the success path needs a real
+    // descriptor while the errno path needs an unopened one.
+    int pipe_ends[2] = {-1, -1};
+    ASSERT_EQ(::pipe(pipe_ends), 0);
+    EXPECT_EQ(io.close(pipe_ends[0]), 0);
+    EXPECT_EQ(io.last_error, 0);
+    EXPECT_EQ(io.close(pipe_ends[1]), 0);
+    // An unopened fake descriptor really does fail; the errno is kept for diagnostics.
+    EXPECT_EQ(io.close(7), -1);
+    EXPECT_EQ(io.last_error, EBADF);
+}
+
+namespace {
+bmc::http::ParseResult feed_all(bmc::http::Parser& parser, const std::string& text) {
+    // 逐字节喂入，顺带验证增量解析在任意分片边界都能工作。
+    bmc::http::ParseResult result = bmc::http::ParseResult::incomplete;
+    for (const char character : text) {
+        result = parser.feed(&character, 1);
+        if (result != bmc::http::ParseResult::incomplete) {
+            return result;
+        }
+    }
+    return result;
+}
+}
+
+TEST(HttpParser, ParsesGetWithHeadersAndIsCaseInsensitive) {
+    bmc::http::Parser parser;
+    const auto result = feed_all(parser,
+        "GET /redfish/v1/ HTTP/1.1\r\nHost: bmc.local:8000\r\nAccept: application/json\r\n\r\n");
+    ASSERT_EQ(result, bmc::http::ParseResult::complete);
+    EXPECT_EQ(parser.request().method, "GET");
+    EXPECT_EQ(parser.request().target, "/redfish/v1/");
+    EXPECT_EQ(parser.request().version, "HTTP/1.1");
+    EXPECT_TRUE(parser.request().body.empty());
+    EXPECT_EQ(parser.request().header("host"), "bmc.local:8000");
+    EXPECT_EQ(parser.request().header("HOST"), "bmc.local:8000");
+    EXPECT_EQ(parser.request().header("ACCEPT"), "application/json");
+    EXPECT_TRUE(parser.request().has_header("Accept"));
+    EXPECT_FALSE(parser.request().has_header("Authorization"));
+    EXPECT_EQ(parser.request().header("Authorization"), "");
+}
+
+TEST(HttpParser, ParsesPostBodyByContentLength) {
+    bmc::http::Parser parser;
+    const auto result = feed_all(parser,
+        "POST /v1/actions/fan HTTP/1.1\r\nHost: bmc\r\nContent-Length: 26\r\n\r\n"
+        "{\"sensor\":\"cpu\",\"act\":\"x\"}");
+    ASSERT_EQ(result, bmc::http::ParseResult::complete);
+    EXPECT_EQ(parser.request().method, "POST");
+    EXPECT_EQ(parser.request().target, "/v1/actions/fan");
+    EXPECT_EQ(parser.request().body, "{\"sensor\":\"cpu\",\"act\":\"x\"}");
+    EXPECT_EQ(parser.request().body.size(), 26u);
+}
+
+TEST(HttpParser, HandlesBodySplitAcrossArbitraryChunks) {
+    // 粘包 + 半包：一次喂入两条请求的前缀，再补全。
+    bmc::http::Parser parser;
+    EXPECT_EQ(parser.feed("POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nab"),
+              bmc::http::ParseResult::incomplete);
+    EXPECT_EQ(parser.buffered_bytes(), 3u);
+    EXPECT_EQ(parser.feed("cde"), bmc::http::ParseResult::complete);
+    EXPECT_EQ(parser.request().body, "abcde");
+    // 同一连接上的下一条请求：feed 返回 complete 后解析器自动丢弃多余字节，
+    // 因此直接继续 feed 即可，不会误判为 incomplete。
+    EXPECT_EQ(parser.feed("GET /b HTTP/1.1\r\n\r\n"), bmc::http::ParseResult::complete);
+    EXPECT_EQ(parser.request().target, "/b");
+    EXPECT_EQ(parser.buffered_bytes(), 0u);
+    parser.reset();
+    EXPECT_EQ(parser.buffered_bytes(), 0u);
+}
+
+TEST(HttpParser, RejectsChunkedAndOtherUnsupportedForms) {
+    {
+        bmc::http::Parser parser;
+        EXPECT_EQ(feed_all(parser, "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"),
+                  bmc::http::ParseResult::unsupported);
+    }
+    // 方法必须是 token，"GET\t/" 之类被拒。
+    {
+        bmc::http::Parser parser;
+        EXPECT_EQ(feed_all(parser, "GE T /a HTTP/1.1\r\n\r\n"), bmc::http::ParseResult::malformed);
+    }
+    // 版本必须是 1.0/1.1。
+    {
+        bmc::http::Parser parser;
+        EXPECT_EQ(feed_all(parser, "GET /a HTTP/2\r\n\r\n"), bmc::http::ParseResult::malformed);
+    }
+    // 头部缺少冒号。
+    {
+        bmc::http::Parser parser;
+        EXPECT_EQ(feed_all(parser, "GET /a HTTP/1.1\r\nBroken\r\n\r\n"), bmc::http::ParseResult::malformed);
+    }
+    // 头部名含非法字符。
+    {
+        bmc::http::Parser parser;
+        EXPECT_EQ(feed_all(parser, "GET /a HTTP/1.1\r\nBad Header: x\r\n\r\n"), bmc::http::ParseResult::malformed);
+    }
+    // Content-Length 非数字或溢出。
+    {
+        bmc::http::Parser parser;
+        EXPECT_EQ(feed_all(parser, "POST /a HTTP/1.1\r\nContent-Length: 5x\r\n\r\n"),
+                  bmc::http::ParseResult::malformed);
+    }
+    {
+        bmc::http::Parser parser;
+        EXPECT_EQ(feed_all(parser, "POST /a HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n\r\n"),
+                  bmc::http::ParseResult::malformed);
+    }
+    // 目标含控制字符（请求行注入尝试）。
+    {
+        bmc::http::Parser parser;
+        EXPECT_EQ(feed_all(parser, "GET /a\x01b HTTP/1.1\r\n\r\n"), bmc::http::ParseResult::malformed);
+    }
+}
+
+TEST(HttpParser, EnforcesSizeLimits) {
+    // 请求行超限。
+    {
+        bmc::http::Parser parser;
+        const std::string huge = "GET /" + std::string(bmc::http::kMaxRequestLine + 10, 'a') + " HTTP/1.1\r\n\r\n";
+        EXPECT_EQ(parser.feed(huge), bmc::http::ParseResult::too_large);
+    }
+    // 单个头部行超限。
+    {
+        bmc::http::Parser parser;
+        const std::string huge = "GET /a HTTP/1.1\r\nX: " + std::string(bmc::http::kMaxHeaderLine + 10, 'b') + "\r\n\r\n";
+        EXPECT_EQ(parser.feed(huge), bmc::http::ParseResult::too_large);
+    }
+    // 头部总量超限：用许多合法小头部堆到上限之上。
+    {
+        bmc::http::Parser parser;
+        std::string request = "GET /a HTTP/1.1\r\n";
+        while (request.size() < bmc::http::kMaxHeaderTotal + 512) {
+            request += "X-Pad: 0123456789\r\n";
+        }
+        request += "\r\n";
+        EXPECT_EQ(parser.feed(request), bmc::http::ParseResult::too_large);
+    }
+    // 头部条数超限。
+    {
+        bmc::http::Parser parser;
+        std::string request = "GET /a HTTP/1.1\r\n";
+        for (std::size_t index = 0; index < bmc::http::kMaxHeaders + 1; ++index) {
+            request += "X: 1\r\n";
+        }
+        request += "\r\n";
+        EXPECT_EQ(parser.feed(request), bmc::http::ParseResult::too_large);
+    }
+    // 声明超长请求体：头部解析完即拒绝，不需要真的收到那么多字节。
+    {
+        bmc::http::Parser parser;
+        EXPECT_EQ(feed_all(parser, "POST /a HTTP/1.1\r\nContent-Length: 1048577\r\n\r\n"),
+                  bmc::http::ParseResult::too_large);
+    }
+    // 错误状态是粘滞的，直到 reset()。
+    {
+        bmc::http::Parser parser;
+        EXPECT_EQ(parser.feed(std::string("GET /") + std::string(bmc::http::kMaxRequestLine + 4, 'a')),
+                  bmc::http::ParseResult::too_large);
+        EXPECT_EQ(parser.feed("GET /a HTTP/1.1\r\n\r\n"), bmc::http::ParseResult::too_large);
+        parser.reset();
+        EXPECT_EQ(feed_all(parser, "GET /a HTTP/1.1\r\n\r\n"), bmc::http::ParseResult::complete);
+    }
+}
+
+TEST(HttpParser, IncompleteInputNeverReportsComplete) {
+    bmc::http::Parser parser;
+    // 一个只发一半头部就停下的慢客户端：解析器只能一直说"还要更多"。
+    EXPECT_EQ(parser.feed("GET /redfish/v1/ HTTP/1.1\r\nHost: bmc"), bmc::http::ParseResult::incomplete);
+    EXPECT_EQ(parser.feed("\r\nContent-Length: 4\r\n"), bmc::http::ParseResult::incomplete);
+    EXPECT_EQ(parser.buffered_bytes() > 0, true);
+    EXPECT_EQ(parser.feed(""), bmc::http::ParseResult::incomplete);
+    EXPECT_EQ(parser.feed(nullptr, 0), bmc::http::ParseResult::incomplete);
+}
+
+TEST(RateLimiter, EnforcesCapacityAndRefillsOverTime) {
+    using clock = std::chrono::steady_clock;
+    const auto start = clock::time_point{} + std::chrono::seconds(1);
+    bmc::http::RateLimiter limiter(3, 1.0, 16);  // 容量 3，每秒回填 1 个
+
+    EXPECT_TRUE(limiter.allow("10.0.0.1", start));
+    EXPECT_TRUE(limiter.allow("10.0.0.1", start));
+    EXPECT_TRUE(limiter.allow("10.0.0.1", start));
+    EXPECT_FALSE(limiter.allow("10.0.0.1", start)) << "capacity exhausted";
+    // 每个键独立计数。
+    EXPECT_TRUE(limiter.allow("10.0.0.2", start));
+    // 1 秒后回填 1 个令牌，恰好放行一次。
+    const auto later = start + std::chrono::seconds(1);
+    EXPECT_TRUE(limiter.allow("10.0.0.1", later));
+    EXPECT_FALSE(limiter.allow("10.0.0.1", later));
+    // 长时间空闲不会超过容量。
+    const auto much_later = later + std::chrono::hours(1);
+    EXPECT_NEAR(limiter.tokens("10.0.0.1", much_later), 3.0, 1e-9);
+    EXPECT_TRUE(limiter.allow("10.0.0.1", much_later));
+    EXPECT_TRUE(limiter.allow("10.0.0.1", much_later));
+    EXPECT_TRUE(limiter.allow("10.0.0.1", much_later));
+    EXPECT_FALSE(limiter.allow("10.0.0.1", much_later));
+}
+
+TEST(RateLimiter, BoundsTrackedKeysAndRejectsNewOnes) {
+    using clock = std::chrono::steady_clock;
+    const auto now = clock::time_point{} + std::chrono::seconds(1);
+    bmc::http::RateLimiter limiter(1, 1.0, 3);
+    EXPECT_TRUE(limiter.allow("a", now));
+    EXPECT_TRUE(limiter.allow("b", now));
+    EXPECT_TRUE(limiter.allow("c", now));
+    EXPECT_EQ(limiter.tracked_keys(), 3u);
+    // 表已满：陌生来源被保守拒绝，而不是让表无界增长。
+    EXPECT_FALSE(limiter.allow("d", now));
+    EXPECT_EQ(limiter.tracked_keys(), 3u);
+    // 已知键仍然可用（回填后）。
+    EXPECT_TRUE(limiter.allow("a", now + std::chrono::seconds(10)));
+    limiter.clear();
+    EXPECT_EQ(limiter.tracked_keys(), 0u);
+    EXPECT_TRUE(limiter.allow("d", now));
+}
+
+TEST(RateLimiter, RejectsInvalidConfiguration) {
+    EXPECT_THROW(bmc::http::RateLimiter(0, 1.0, 4), std::invalid_argument);
+    EXPECT_THROW(bmc::http::RateLimiter(1, -1.0, 4), std::invalid_argument);
+    EXPECT_THROW(bmc::http::RateLimiter(1, 1.0, 0), std::invalid_argument);
 }
 }
