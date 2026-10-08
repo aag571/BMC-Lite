@@ -5,7 +5,9 @@
 #include <atomic>
 #include <cerrno>
 #include <cmath>
+#include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <gtest/gtest.h>
 #include <limits>
@@ -13,6 +15,7 @@
 #include <linux/i2c-dev.h>
 #include <linux/i2c.h>
 #include <fstream>
+#include <fcntl.h>
 #include <future>
 #include <initializer_list>
 #include <map>
@@ -753,6 +756,151 @@ TEST(Sel, PersistsSequencesAndLimitsRecords) {
     EXPECT_EQ(restored.query()[0].id, 2u);
     EXPECT_EQ(restored.next_id(), 4u);
     std::filesystem::remove(path);
+}
+TEST(Sel, BatchesWritesAndFlushIsMeaningful) {
+    const auto path = temporary("-sel-batch.db");
+    std::filesystem::remove(path);
+    // 把 stdout 重定向到 /dev/null，用真实写入路径测试批量语义。
+    std::fflush(stdout);
+    const int saved = ::dup(STDOUT_FILENO);
+    ASSERT_GE(saved, 0);
+    const int null_fd = ::open("/dev/null", O_WRONLY);
+    ASSERT_GE(null_fd, 0);
+    ASSERT_NE(::dup2(null_fd, STDOUT_FILENO), -1);
+    ::close(null_fd);
+    {
+        bmc::SelStore store(path, 4096);
+        // 单条记录远小于批次阈值，写完后应当仍在缓冲区里。
+        store.append("cpu", "normal", "sample");
+        EXPECT_GT(store.pending_bytes(), 0u);
+        EXPECT_TRUE(store.flush());
+        EXPECT_EQ(store.pending_bytes(), 0u);
+        EXPECT_EQ(store.write_failures(), 0u);
+        // 累计超过 4096 字节后自动落盘。
+        for (unsigned index = 0; index < 200; ++index) {
+            store.append("cpu", "normal", "sample-" + std::to_string(index));
+        }
+        EXPECT_LT(store.pending_bytes(), 4096u);
+    }
+    std::fflush(stdout);
+    ASSERT_NE(::dup2(saved, STDOUT_FILENO), -1);
+    ::close(saved);
+    // 重启后应当读回全部 201 条记录。
+    bmc::SelStore reopened(path, 4096);
+    // query() defaults to the most recent 100 records, so ask for all of them.
+    EXPECT_EQ(reopened.query(500).size(), 201u);
+    std::filesystem::remove(path);
+}
+TEST(Sel, TruncatesTornTailOnStartupAndReportsIt) {
+    const auto path = temporary("-sel-tail.db");
+    // 一个完整记录 + 一条崩溃留下的残缺记录（没有换行结尾）。
+    {
+        std::ofstream output(path, std::ios::binary);
+        output << "1 1000 \"cpu\" \"critical\" \"hot\" 95\n2 2000 \"cpu\" \"normal\" \"partial";
+    }
+    const auto before = std::filesystem::file_size(path);
+    bmc::SelStore store(path);
+    // 只有完整记录被重放，残缺尾部按截断处理。
+    ASSERT_EQ(store.query().size(), 1u);
+    EXPECT_EQ(store.query()[0].id, 1u);
+    EXPECT_GT(store.truncated_bytes(), 0u);
+    EXPECT_LT(std::filesystem::file_size(path), before);
+    // 截断后文件可以继续正常追加，并且不会破坏已有记录。
+    store.append("fan", "failed", "stalled", std::nullopt, true);
+    EXPECT_TRUE(store.flush());
+    EXPECT_EQ(store.truncated_bytes(), before - 42u);    bmc::SelStore reopened(path);
+    ASSERT_EQ(reopened.query().size(), 2u);
+    EXPECT_EQ(reopened.query()[1].source, "fan");
+    EXPECT_EQ(reopened.next_id(), 3u);
+    std::filesystem::remove(path);
+}
+TEST(Sel, RefusePolicyKeepsTornTailOnDisk) {
+    const auto path = temporary("-sel-refuse.db");
+    {
+        std::ofstream output(path, std::ios::binary);
+        output << "1 1000 \"cpu\" \"critical\" \"hot\" 95\n2 2000 \"cpu\" \"normal\" \"partial";
+    }
+    const auto before = std::filesystem::file_size(path);
+    bmc::SelStore store(path, 4096, bmc::Truncate::refuse);
+    EXPECT_GT(store.truncated_bytes(), 0u);
+    // refuse 不修改文件，残缺行原样保留。
+    EXPECT_EQ(std::filesystem::file_size(path), before);
+    std::filesystem::remove(path);
+}
+TEST(Sel, SyncFailureIsCountedSeparatelyFromWriteFailure) {
+    // /dev/null 是字符设备：写入成功但 fdatasync 会返回 EINVAL。
+    // 这种情况不是数据丢失，因此必须与真正的写入失败分开计数，且不应影响 flush 的结论。
+    {
+        bmc::SelStore store("/dev/null", 4096);
+        EXPECT_NO_THROW(store.append("cpu", "normal", "sample", std::nullopt, true));
+        EXPECT_EQ(store.write_failures(), 0u);
+        EXPECT_EQ(store.sync_failures(), 0u);
+        EXPECT_TRUE(store.flush());
+    }
+    // 普通文件上两个计数都应为 0。
+    const auto path = temporary("-sel-sync.db");
+    {
+        bmc::SelStore store(path, 4096);
+        store.append("cpu", "normal", "sample", std::nullopt, true);
+        EXPECT_EQ(store.write_failures(), 0u);
+        EXPECT_EQ(store.sync_failures(), 0u);
+        EXPECT_TRUE(store.flush());
+    }
+    std::filesystem::remove(path);
+}
+TEST(Sel, WriteFailureDegradesInsteadOfTerminating) {
+    // 用一个"无法再写入"的目标制造稳定失败：先打开管道写端并把容量填满，
+    // 再让 SelStore 以非阻塞方式打开同一路径（/proc/self/fd/N），
+    // 此时每次 write 都以 EAGAIN 失败。这比 /dev/full 更可移植（容器里常常没有该设备）。
+    int ends[2] = {-1, -1};
+    ASSERT_EQ(::pipe(ends), 0);
+    ASSERT_NE(::fcntl(ends[1], F_SETFL, ::fcntl(ends[1], F_GETFL) | O_NONBLOCK), -1);
+    const std::string filler(4096, 'x');
+    for (;;) {
+        const auto written = ::write(ends[1], filler.data(), filler.size());
+        if (written <= 0) {
+            break;
+        }
+    }
+    const std::string target = "/proc/self/fd/" + std::to_string(ends[1]);
+    {
+        bmc::SelStore store(target, 4096);
+        // 调小上限，就能在不写 1 MiB 数据的前提下验证"超限丢弃最旧内容"。
+        store.set_pending_cap(16);
+        store.set_nonblocking(true);
+        for (unsigned index = 0; index < 4; ++index) {
+            EXPECT_NO_THROW(store.append("cpu", "critical", "hot", 95, true));
+        }
+        EXPECT_GT(store.write_failures(), 0u);
+        EXPECT_FALSE(store.flush());
+        EXPECT_LE(store.pending_bytes(), 16u);
+        EXPECT_GT(store.dropped_bytes(), 0u);
+    }
+    ::close(ends[0]);
+    ::close(ends[1]);
+}TEST(Sel, LoggerRotatesThroughPersistentDescriptor) {
+    const auto path = temporary("-log-fd");
+    {
+        bmc::Logger logger(path, 200, 2);
+        for (unsigned index = 0; index < 8; ++index) {
+            logger.action("sensor", "entry-" + std::to_string(index));
+        }
+    }
+    EXPECT_TRUE(std::filesystem::exists(path));
+    EXPECT_TRUE(std::filesystem::exists(path.string() + ".1"));
+    // 轮转后的分片里必须是完整的 JSON 行，没有因为常驻描述符而被截断。
+    std::ifstream input(path.string() + ".1");
+    std::string line;
+    int lines = 0;
+    while (std::getline(input, line)) {
+        EXPECT_EQ(line.front(), '{');
+        EXPECT_EQ(line.back(), '}');
+        ++lines;
+    }
+    EXPECT_GT(lines, 0);
+    for (const auto& suffix : {"", ".1", ".2", ".3"}) {
+        std::filesystem::remove(path.string() + suffix);
+    }
 }
 TEST(Gpio, RejectsMalformedPathsBeforeOpeningHardware) {
     auto config = policy();

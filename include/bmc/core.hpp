@@ -157,20 +157,65 @@ std::vector<FaultRule> load_rules(const std::filesystem::path& path);
 struct RecoveryRequest { std::string rule; std::string sensor; std::string action; std::uint64_t sequence; std::string path; };
 struct RecoveryResult { std::string rule; std::string sensor; std::string action; bool accepted; bool success; unsigned attempts; std::string detail; };
 struct SelRecord { std::uint64_t id; std::int64_t time_ms; std::string source; std::string state; std::string message; std::optional<double> value; };
+// 启动重放时发现尾部残缺记录的处置方式：
+//   refuse —— 只追加不回退，残缺行留在文件中间（无法修复但绝不丢数据）；
+//   tail   —— 从残缺记录起点截断后追加（默认；对日志文件通常更正确）；
+//   prepare—— 重放后只走 prepare/commit，不真正写入，用于测试与只读检查。
+enum class Truncate { refuse, tail, prepare };
+// SEL 用常驻描述符追加写入；记录在内存与文件中同时只保留最近 max_records 条。
+// 每次 append 都尝试落盘，但只有缓冲区达到 batch_bytes 或记录属于"关键"（状态迁移/恢复）时才
+// 真正 write+fdatasync，从而把每行一次系统调用降为每批一次，同时不牺牲故障证据的持久性。
 class SelStore {
 public:
-    explicit SelStore(std::filesystem::path path, std::size_t max_records = 4096);
-    std::uint64_t append(const std::string& source, const std::string& state, const std::string& message, std::optional<double> value = std::nullopt);
+    explicit SelStore(std::filesystem::path path, std::size_t max_records = 4096, Truncate policy = Truncate::tail);
+    ~SelStore();
+    SelStore(const SelStore&) = delete;
+    SelStore& operator=(const SelStore&) = delete;
+    // important=true 表示该记录是故障证据，应立即落盘。
+    std::uint64_t append(const std::string& source, const std::string& state, const std::string& message,
+                         std::optional<double> value = std::nullopt, bool important = false);
     std::vector<SelRecord> query(std::size_t limit = 100) const;
     std::uint64_t next_id() const;
-    void flush();
+    // 把缓冲区写入磁盘并 fdatasync；缓冲区仍非空时返回 false。
+    bool flush();
+    // 处于 pending 状态（尚未成功落盘）的字节数。
+    std::size_t pending_bytes() const;
+    // 累计写入失败次数与因失败被丢弃的字节数，用于上报降级状态。
+    std::uint64_t write_failures() const;
+    std::uint64_t dropped_bytes() const;
+    // fdatasync 失败次数。设备节点等不支持同步的路径会持续失败，因此单独计数，
+    // 不与写入失败混淆：写到页缓存仍可能被内核落盘。
+    std::uint64_t sync_failures() const;
+    // 启动时因尾部残缺而被丢弃的字节数；仅在允许截断时文件会被修复。
+    std::uint64_t truncated_bytes() const;
+    // 未落盘缓冲区的上限；超过后丢弃最旧的未落盘字节。生产默认 1 MiB，测试可调小。
+    void set_pending_cap(std::size_t bytes);
+    // 让写失败立即返回而不是阻塞。管道等目标在满的时候会阻塞，开启后便于测试与快速降级。
+    void set_nonblocking(bool enabled);
+    // 仅在文件不存在时创建（O_CREAT|O_EXCL），用于测试与探测路径不可写的场景。
+    static void write_probe(const std::filesystem::path& path);
 private:
-    void load();
+    void open();
+    void replay();
+    void trim();
+    bool drain(bool sync);
+    void drop_oldest(std::size_t count);
     std::filesystem::path path_;
     std::size_t max_records_;
+    Truncate policy_;
     mutable std::mutex mutex_;
     std::vector<SelRecord> records_;
+    std::string pending_;
     std::uint64_t next_id_ = 1;
+    std::uint64_t write_failures_ = 0;
+    std::uint64_t sync_failures_ = 0;
+    std::uint64_t dropped_bytes_ = 0;
+    std::uint64_t truncated_bytes_ = 0;
+    int descriptor_ = -1;
+    // 只有普通文件才尝试 fdatasync；设备节点对 fsync/fdatasync 返回 EINVAL。
+    bool syncable_ = false;
+    std::size_t batch_bytes_ = 4096;
+    std::size_t pending_cap_ = 1u << 20;
 };
 class RecoveryPolicyEngine {
 public:
@@ -219,14 +264,19 @@ public:
 class Logger : public EventLogger {
 public:
     Logger(std::filesystem::path path, std::uintmax_t limit = 1048576, unsigned keep = 3);
+    ~Logger();
+    Logger(const Logger&) = delete;
+    Logger& operator=(const Logger&) = delete;
     void write(const Event& event) override;
     void action(const std::string& id, const std::string& result) override;
 private:
     void append(const std::string& line);
     void rotate(std::size_t incoming);
+    void open();
     std::filesystem::path path_;
     std::uintmax_t limit_;
     unsigned keep_;
+    int descriptor_ = -1;
     std::mutex mutex_;
 };
 class Worker {

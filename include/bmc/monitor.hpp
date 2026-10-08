@@ -19,5 +19,10 @@ public:
     void poll(std::vector<MonitorSensor>& sensors, EventLogger& logger, Worker& worker,
               EventBus& bus, FaultRuleEngine& rules, RecoveryPolicyEngine& recovery,
               SelStore& sel, std::atomic_bool&);
+private:
+    void report_sel_degradation(EventLogger& logger, EventBus& bus, SelStore& sel);
+    // 只在 SEL 写入失败次数增加时上报一次，避免每 tick 重复刷屏；
+    // 该记录本身以非关键方式追加，因此不会再触发一次落盘尝试。
+    std::uint64_t reported_sel_failures_ = 0;
 };
 }

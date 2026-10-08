@@ -215,4 +215,4 @@ sudo apt-get install -y valgrind
 bash tools/validate.sh valgrind
 ```
 
-This is an educational resume project, not complete BMC firmware. SEL is a custom text format without power-loss durability guarantees. Real I2C/GPIO electrical behavior needs hardware or an appropriate QEMU model. Python OS descriptor tests are not mocked C++ ioctl tests. See `docs/code-guide.md` for the source reading order.
+This is an educational resume project, not complete BMC firmware. SEL is a custom text format without CRC or power-loss atomicity guarantees: startup repairs a torn trailing record by truncating it and reports the discarded byte count, but a bit flip in the middle of the file is not detectable. SEL write failures degrade with counters and a reported event instead of stopping the daemon, while a log write failure still exits. Real I2C/GPIO electrical behavior needs hardware or an appropriate QEMU model. Python OS descriptor tests are not mocked C++ ioctl tests. See `docs/code-guide.md` for the source reading order.

@@ -223,6 +223,13 @@ int run(const Options& settings) {
         " completed=" + std::to_string(task_stats.completed) +
         " failed=" + std::to_string(task_stats.failed) +
         " rejected=" + std::to_string(task_stats.rejected));
+    // SEL 使用常驻描述符与批量写入，退出前必须把缓冲区落盘。
+    const bool sel_flushed = sel.flush();
+    logger.action("sel", std::string("flushed=") + (sel_flushed ? "true" : "false") +
+        " write_failures=" + std::to_string(sel.write_failures()) +
+        " sync_failures=" + std::to_string(sel.sync_failures()) +
+        " dropped_bytes=" + std::to_string(sel.dropped_bytes()) +
+        " truncated_bytes=" + std::to_string(sel.truncated_bytes()));
     if (worker_failed.load()) {
         throw std::runtime_error("recovery worker could not write audit log");
     }

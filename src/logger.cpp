@@ -1,10 +1,14 @@
 #include "bmc/core.hpp"
+#include <cerrno>
 #include <chrono>
 #include <cmath>
-#include <fstream>
+#include <fcntl.h>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+#include <system_error>
+#include <unistd.h>
 
 namespace bmc {
 namespace {
@@ -12,6 +16,22 @@ std::string timestamp() {
     const auto now = std::chrono::system_clock::now();
     const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     return std::to_string(milliseconds);
+}
+void write_all(int descriptor, const std::string& text) {
+    std::size_t offset = 0;
+    while (offset < text.size()) {
+        const auto written = ::write(descriptor, text.data() + offset, text.size() - offset);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            throw std::system_error(errno, std::generic_category(), "write log");
+        }
+        if (written == 0) {
+            throw std::runtime_error("short log write");
+        }
+        offset += static_cast<std::size_t>(written);
+    }
 }
 }
 Logger::Logger(std::filesystem::path path, std::uintmax_t limit, unsigned keep)
@@ -22,9 +42,31 @@ Logger::Logger(std::filesystem::path path, std::uintmax_t limit, unsigned keep)
     if (!path_.parent_path().empty()) {
         std::filesystem::create_directories(path_.parent_path());
     }
+    open();
+}
+Logger::~Logger() {
+    std::lock_guard lock(mutex_);
+    if (descriptor_ >= 0) {
+        ::close(descriptor_);
+        descriptor_ = -1;
+    }
+}
+void Logger::open() {
+    descriptor_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (descriptor_ < 0) {
+        throw std::system_error(errno, std::generic_category(), "open log");
+    }
 }
 void Logger::rotate(std::size_t incoming) {
-    if (!std::filesystem::exists(path_) || std::filesystem::file_size(path_) + incoming <= limit_) {
+    if (descriptor_ >= 0) {
+        ::close(descriptor_);
+        descriptor_ = -1;
+    }
+    std::error_code status;
+    const auto size = std::filesystem::file_size(path_, status);
+    if (status || size + incoming <= limit_) {
+        // 未超限（或文件尚不存在）时无需轮转，直接重新打开继续追加。
+        open();
         return;
     }
     for (unsigned index = keep_; index > 0; --index) {
@@ -37,14 +79,15 @@ void Logger::rotate(std::size_t incoming) {
             std::filesystem::rename(source, destination);
         }
     }
+    open();
 }
 void Logger::append(const std::string& line) {
     std::lock_guard lock(mutex_);
     rotate(line.size() + 1);
-    std::ofstream output(path_, std::ios::app);
-    output.exceptions(std::ios::badbit | std::ios::failbit);
-    output << line << '\n';
-    output.flush();
+    if (descriptor_ < 0) {
+        throw std::runtime_error("log descriptor is closed");
+    }
+    write_all(descriptor_, line + "\n");
 }
 void Logger::write(const Event& event) {
     std::ostringstream output;

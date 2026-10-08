@@ -26,7 +26,7 @@ I2C 有两种后端：`i2c` 是原始无符号 SMBus word，比例由配置决�
 ./build/bmc-lite --config config/hardware.conf --gpio /sys/class/gpio/gpio23/value
 ```
 
-SIGTERM/SIGINT 有序停止并 drain 恢复队列。Critical 状态变化可提交一次恢复，冷却 30 秒。当前不对持续 Critical 自动重试。日志写入失败退出服务。没有网络管理面、关机/复位脚本。硬件专用驱动只覆盖 docs/chips.md 列出的六种型号，其余芯片仍需 `i2c` 原始寄存器后端加标定。
+SIGTERM/SIGINT 有序停止并 drain 恢复队列。Critical 状态变化可提交一次恢复，冷却 30 秒。当前不对持续 Critical 自动重试。日志写入失败仍会让服务退出（故障证据不可丢）；SEL 写入失败改为可观测降级：计数、上报事件，并在 1 MiB 上限内保留未落盘数据，不会让 daemon 消失。没有网络管理面、关机/复位脚本。硬件专用驱动只覆盖 docs/chips.md 列出的六种型号，其余芯片仍需 `i2c` 原始寄存器后端加标定。
 
 ## 完成度
 

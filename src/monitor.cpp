@@ -24,13 +24,14 @@ void Monitor::poll(std::vector<MonitorSensor>& sensors, bmc::EventLogger& logger
         const bmc::Event event = transition.value_or(bmc::Event{sensor.config.id, sensor.engine.state(), sensor.engine.state(), value, "sample", 0});
         if (transition) {
             logger.write(event);
-            sel.append(event.id, bmc::name(event.after), event.reason, event.value);
+            // 状态迁移是关键故障证据，立即落盘。
+            sel.append(event.id, bmc::name(event.after), event.reason, event.value, true);
             bus.publish({bmc::BusEventType::sensor_state, event.id, bmc::name(event.after), event.value});
         }
         for (const auto& decision : rules.evaluate(event)) {
             const auto message = std::string(decision.active ? "activated:" : "cleared:") + decision.action;
             logger.action(decision.rule, message);
-            sel.append(decision.rule, decision.active ? "active" : "clear", message, event.value);
+            sel.append(decision.rule, decision.active ? "active" : "clear", message, event.value, true);
             bus.publish({bmc::BusEventType::recovery, decision.rule, message, event.value});
             if (decision.active) {
                 // 请求复制配置快照；任务只引用生命周期长于线程池的基础服务。
@@ -41,7 +42,7 @@ void Monitor::poll(std::vector<MonitorSensor>& sensors, bmc::EventLogger& logger
                         if (result) {
                             const auto detail = result->detail + ": attempts=" + std::to_string(result->attempts);
                             logger.action(request.rule, detail);
-                            sel.append(request.sensor, "recovery", detail);
+                            sel.append(request.sensor, "recovery", detail, std::nullopt, true);
                             bus.publish({bmc::BusEventType::recovery, request.sensor, detail, std::nullopt});
                         }
                     } catch (...) { worker_failed.store(true); throw; }
@@ -52,6 +53,24 @@ void Monitor::poll(std::vector<MonitorSensor>& sensors, bmc::EventLogger& logger
         }
         if (transition) std::cout << event.id << ": " << bmc::name(event.before) << " -> " << bmc::name(event.after) << '\n';
     }
+    report_sel_degradation(logger, bus, sel);
+}
+
+void Monitor::report_sel_degradation(EventLogger& logger, EventBus& bus, SelStore& sel) {
+    // 写入失败不再终止服务：这里把失败次数与丢弃字节数上报一次，把"故障证据正在丢失"这件事
+    // 变成可观测状态，而不是让整个 daemon 消失。上报记录本身不设为关键，避免每次失败都重试落盘。
+    const auto failures = sel.write_failures();
+    if (failures == reported_sel_failures_) {
+        return;
+    }
+    reported_sel_failures_ = failures;
+    const auto message = "sel-write-failures=" + std::to_string(failures) +
+        " sync-failures=" + std::to_string(sel.sync_failures()) +
+        " pending=" + std::to_string(sel.pending_bytes()) +
+        " dropped=" + std::to_string(sel.dropped_bytes());
+    logger.action("sel", message);
+    sel.append("sel", "degraded", message);
+    bus.publish({bmc::BusEventType::service, "sel", message, std::nullopt});
 }
 
 }
