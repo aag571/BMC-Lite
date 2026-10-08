@@ -148,6 +148,12 @@ public:
     explicit FaultRuleEngine(std::vector<FaultRule> rules);
     std::vector<RuleDecision> evaluate(const Event& event);
     void reset();
+    // 校验一组规则是否符合策略；热重载在改动任何状态之前调用它，保证重载是原子的。
+    static void validate(const std::vector<FaultRule>& rules);
+    // 热重载：按"规则 id 与触发状态都没变"保留该规则在每个传感器上的确认计数与 active 标志。
+    // 已消失的传感器、被删除的规则、以及触发状态被改写的规则，其运行时状态一律丢弃，
+    // 否则保留下来的 active 会对应到不同的判定条件上。
+    void merge(std::vector<FaultRule> rules, const std::vector<std::string>& sensors);
 private:
     struct Runtime { unsigned bad = 0; unsigned good = 0; bool active = false; std::uint64_t sequence = 0; };
     std::vector<FaultRule> rules_;

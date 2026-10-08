@@ -981,4 +981,56 @@ TEST(Rules, WildcardSensorsHaveIndependentState) {
     EXPECT_EQ(engine.evaluate({"cpu", bmc::State::critical, bmc::State::normal, 40, "sample", 2}).size(), 1u);
     EXPECT_TRUE(engine.evaluate({"fan", bmc::State::critical, bmc::State::critical, 0, "sample", 2}).empty());
 }
+TEST(Rules, ReloadKeepsActiveRuleActivated) {
+    // 已激活的规则在热重载后必须保持 active，否则每次 reload 都会再触发一次恢复动作。
+    bmc::FaultRuleEngine engine({{"r", "cpu", bmc::State::critical, 1, 1, "increase_fan"}});
+    EXPECT_EQ(engine.evaluate({"cpu", bmc::State::normal, bmc::State::critical, 95, "sample", 1}).size(), 1u);
+    engine.merge({{"r", "cpu", bmc::State::critical, 1, 1, "increase_fan"}}, {"cpu"});
+    // 仍是 critical：已 active，不应再次产生 decision。
+    EXPECT_TRUE(engine.evaluate({"cpu", bmc::State::critical, bmc::State::critical, 95, "sample", 2}).empty());
+    // 恢复仍然要能正常清除。
+    EXPECT_EQ(engine.evaluate({"cpu", bmc::State::critical, bmc::State::normal, 40, "sample", 3}).size(), 1u);
+}
+TEST(Rules, ReloadKeepsPartialConfirmationCount) {
+    // confirmations=3：重载前已确认 2 次，重载后第 3 次就应当激活，而不是从头再数。
+    bmc::FaultRuleEngine engine({{"r", "cpu", bmc::State::critical, 3, 1, "increase_fan"}});
+    EXPECT_TRUE(engine.evaluate({"cpu", bmc::State::normal, bmc::State::critical, 95, "sample", 1}).empty());
+    EXPECT_TRUE(engine.evaluate({"cpu", bmc::State::normal, bmc::State::critical, 95, "sample", 1}).empty());
+    engine.merge({{"r", "cpu", bmc::State::critical, 3, 1, "increase_fan"}}, {"cpu"});
+    EXPECT_EQ(engine.evaluate({"cpu", bmc::State::normal, bmc::State::critical, 95, "sample", 1}).size(), 1u);
+}
+TEST(Rules, ReloadResetsRuleWhoseTriggerChanged) {
+    // 触发状态被改写：留下的 active 对应的是旧条件，必须复位并在新条件下重新确认。
+    bmc::FaultRuleEngine engine({{"r", "cpu", bmc::State::critical, 1, 1, "increase_fan"}});
+    EXPECT_EQ(engine.evaluate({"cpu", bmc::State::normal, bmc::State::critical, 95, "sample", 1}).size(), 1u);
+    // trigger 从 critical 改为 warning。
+    engine.merge({{"r", "cpu", bmc::State::warning, 1, 1, "increase_fan"}}, {"cpu"});
+    // 新的 bad 判定是 warning（或 critical），因此这里会重新激活一次。
+    EXPECT_EQ(engine.evaluate({"cpu", bmc::State::normal, bmc::State::warning, 75, "sample", 2}).size(), 1u);
+}
+TEST(Rules, ReloadDropsStateForRemovedSensor) {
+    bmc::FaultRuleEngine engine({{"all", "*", bmc::State::critical, 1, 1, "inspect_device"}});
+    EXPECT_EQ(engine.evaluate({"cpu", bmc::State::normal, bmc::State::critical, 95, "sample", 1}).size(), 1u);
+    EXPECT_EQ(engine.evaluate({"fan", bmc::State::normal, bmc::State::critical, 0, "sample", 1}).size(), 1u);
+    // fan 被移除：其状态一并丢弃。
+    engine.merge({{"all", "*", bmc::State::critical, 1, 1, "inspect_device"}}, {"cpu"});
+    // 仍然存在的 cpu 保持 active。
+    EXPECT_TRUE(engine.evaluate({"cpu", bmc::State::critical, bmc::State::critical, 95, "sample", 2}).empty());
+}
+TEST(Rules, ReloadDropsStateForRemovedRule) {
+    bmc::FaultRuleEngine engine({{"r", "cpu", bmc::State::critical, 1, 1, "increase_fan"}});
+    EXPECT_EQ(engine.evaluate({"cpu", bmc::State::normal, bmc::State::critical, 95, "sample", 1}).size(), 1u);
+    engine.merge({}, {"cpu"});
+    // 规则被删除后不再产生任何 decision。
+    EXPECT_TRUE(engine.evaluate({"cpu", bmc::State::normal, bmc::State::critical, 95, "sample", 2}).empty());
+}
+TEST(Rules, ReloadRejectsInvalidPolicy) {
+    bmc::FaultRuleEngine engine({{"r", "cpu", bmc::State::critical, 1, 1, "increase_fan"}});
+    // confirmations 为 0 属于非法策略，必须在改动状态之前被拒绝。
+    EXPECT_THROW(bmc::FaultRuleEngine::validate({{"r", "cpu", bmc::State::critical, 0, 1, "increase_fan"}}), std::invalid_argument);
+    EXPECT_THROW(bmc::FaultRuleEngine::validate({{"r", "cpu", bmc::State::critical, 1, 1, "power_cycle"}}), std::invalid_argument);
+    EXPECT_THROW(engine.merge({{"r", "cpu", bmc::State::critical, 0, 1, "increase_fan"}}, {"cpu"}), std::invalid_argument);
+    // 合并失败后原有规则仍然可用。
+    EXPECT_EQ(engine.evaluate({"cpu", bmc::State::normal, bmc::State::critical, 95, "sample", 1}).size(), 1u);
+}
 }

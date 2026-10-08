@@ -7,7 +7,7 @@
 - engine.cpp：纯数值判断、迟滞、连续样本确认，不访问文件和设备。
 - calibration.cpp：gain/offset 线性修正与分段线性插值（区间外钳制）。
 - config.cpp：传感器配置解析与验证（含可选的标定字段与 `i2c:<chip>` 后端）。
-- rules.cpp：规则文件解析、每传感器规则状态与激活/清除。
+- rules.cpp：规则文件解析、策略校验、每 (规则, 传感器) 运行时状态与激活/清除，以及 SIGHUP 重载时的状态合并（`merge`）。
 - readers.cpp：mock/sysfs/原始 I2C/GPIO 读取、设备适配与注册。
 - chips.cpp：I2C 总线封装（I2cBus）与专用芯片驱动（LM75、EMC2103、ADM1275、INA219/INA226）。
   寄存器语义与换算依据见 docs/chips.md。

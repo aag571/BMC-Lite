@@ -179,12 +179,24 @@ int run(const Options& settings) {
                 if (info.ssi_signo == SIGHUP) {
                     try {
                         auto replacement = bmc::prepare_sensors(settings.config, io);
-                        bmc::FaultRuleEngine replacement_rules(std::filesystem::exists(settings.rules) ? bmc::load_rules(settings.rules) : std::vector<bmc::FaultRule>{});
+                        auto replacement_rules = std::filesystem::exists(settings.rules)
+                            ? bmc::load_rules(settings.rules)
+                            : std::vector<bmc::FaultRule>{};
+                        // 先把两份新配置都校验完，再改动任何状态，保证重载是原子的：
+                        // 失败时旧传感器与旧规则都原样保留。
+                        bmc::FaultRuleEngine::validate(replacement_rules);
+                        std::vector<std::string> sensor_ids;
+                        sensor_ids.reserve(replacement.size());
+                        for (const auto& sensor : replacement) {
+                            sensor_ids.push_back(sensor.config.id);
+                        }
                         const auto message = "validated generation " + std::to_string(config_generation + 1);
                         logger.action("configuration", message);
                         bus.publish({bmc::BusEventType::configuration, "configuration", message, std::nullopt});
                         sensors.swap(replacement);
-                        rules = std::move(replacement_rules);
+                        // 合并而不是整体替换：保留仍然成立的 (规则, 传感器) 状态，
+                        // 避免每次 reload 都把已激活规则复位并重复触发一次恢复动作。
+                        rules.merge(std::move(replacement_rules), sensor_ids);
                         ++config_generation;
                     } catch (const std::exception& error) {
                         const auto message = std::string("reload rejected; keeping generation ") + std::to_string(config_generation) + ": " + error.what();
