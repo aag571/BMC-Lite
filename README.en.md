@@ -1,84 +1,54 @@
-# BMC-Lite — Installation and User Guide
+# BMC-Lite: Installation and User Guide
 
-BMC-Lite is a Linux C++20 hardware monitoring and fault-recovery service. The daemon samples devices, confirms fault states, evaluates rules, schedules recovery tasks, and writes JSONL logs and persistent events. A separate Python utility provides read-only HTTP resources and Prometheus metrics.
+> 该文档由AI翻译中文文档
 
 [中文手册](README.md)
 
-## 0. Operating characteristics and known trade-offs
+## 1. Prepare Linux
 
-With control enabled, invalid token, TLS or bind settings make the daemon exit immediately with a nonzero status. Runtime listener or audit failures also exit so systemd can restart it. SEL opens its descriptor nonblocking, although regular-file fdatasync can still incur disk latency. Peer stale/recovered reports enter the bounded event bus and are best effort if its queue is full.
-
-Recovery tasks use two Worker threads by default (configurable with `--worker-threads`), and total retry backoff is capped at 30 ms. A slow action still occupies one thread; a blocked driver call is not forcibly cancelled.
-
-The daemon includes optional read-only HTTP and control services, disabled by default. See the [control guide](docs/控制面部署与使用（英文）.md) for TLS builds, release installation, credentials, systemd setup, requests and auditing.
-
-Optional uplink telemetry provides a bounded queue, nonblocking TCP, reconnection and metrics. See the [uplink deployment and protocol guide](docs/上行遥测部署与使用（英文）.md).
-
-See [runtime reliability](docs/运行时可靠性说明（英文）.md) for logger degradation reporting, rule state cleanup and hardware verification limits.
-
-Authenticated peer heartbeats exchange configuration generations and report stale/recovered peers through a separate port. See the [peer guide](docs/实例心跳部署与使用（英文）.md) and [verification evidence](docs/验证与测试报告.md).
-
-## 1. Choose your installation path
-
-Use **source installation** when developing or running tests. Use the **release archive** when deploying without a compiler. The prebuilt binary is Linux x86_64; its glibc and libstdc++ requirements depend on the build machine. Build from source if the target reports a missing GLIBC/GLIBCXX version. The current release is built on the development VM; Ubuntu 24.04 x86_64 is the recommended target.
-
-The target VM in this example is `192.168.124.128`. Replace `user` with your actual SSH account. Copy the delivered archive and checksum directly; no GitHub Release attachment is assumed to exist.
-
-## 2. Prepare a fresh Ubuntu VM
-
-Run these commands **inside the target VM**:
+Ubuntu 24.04 x86_64 is recommended. Run these commands inside the target VM; replace `user` with your actual SSH account.
 
 ```sh
 uname -m
 cat /etc/os-release
 sudo apt-get update
 sudo apt-get install -y ca-certificates curl python3 tar libstdc++6 libssl3t64 openssl
-```
-
-For source builds, also install:
-
-```sh
+# Source builds also need:
 sudo apt-get install -y git build-essential cmake libssl-dev
 g++ --version
 cmake --version
 ```
 
-GCC 11+ and CMake 3.20+ are required. If you need SSH access, install `openssh-server`, start its service, and verify that the VM is reachable before copying files.
+GCC 11+, CMake 3.20+ and OpenSSL 3 for TLS are required. Simulation needs no hardware. The release build is Linux x86_64 and depends on the build machine's glibc/libstdc++; compile on the target when its libraries are too old.
 
-## 3. Clone, compile, and test from source
+## 2. Clone, compile and test from GitHub
 
 ```sh
 mkdir -p ~/src
 cd ~/src
-git clone https://github.com/aag571/BMC-Lite.git bmc-lite
-cd bmc-lite
-git fetch --tags
+git clone https://github.com/aag571/BMC-Lite.git
+cd BMC-Lite
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DBMC_TLS=ON
 cmake --build build --parallel 2
 ctest --test-dir build --output-on-failure
-```
-
-The first test build downloads GoogleTest 1.15.2. An offline production build can disable tests. The tests are not all Python:
-
-| Component | Implementation | Purpose |
-|---|---|---|
-| `tests/core_test.cpp` / `build/bmc_tests` | C++ / GoogleTest | State machine, rules, recovery, devices, worker, event bus, persistence |
-| `tests/stress_test.cpp` / `build/bmc_stress` | C++ | Concurrent producers and bounded queue accounting |
-| `tests/runtime_test.py` | Python | Process startup, SIGHUP reload, invalid configuration, SIGTERM |
-| `tests/fault_injection_test.py` | Python | Daemon behavior with missing inputs and failed writes |
-| `tests/metrics_test.py` | Python | Python management-tool formatting |
-
-Run C++ tests independently:
-
-```sh
 ./build/bmc_tests
-./build/bmc_tests --gtest_filter='Engine.*:Rules.*:Recovery.*'
+./build/bmc_tests --gtest_filter='Engine.*:Rules.*:Recovery.*:FakeIo.*'
 ./build/bmc_stress
 ```
 
-`LinuxIo` is the injected syscall interface. C++ FakeLinuxIo covers I2C replies, PWM writes, GPIO values and failures. For GPIO it supplies an owned real placeholder descriptor, so CLOEXEC and closure are also tested. Electrical behavior requires hardware.
+The first test build downloads GoogleTest 1.15.2; an offline build can use `-DBUILD_TESTING=OFF`. When updating an existing clone, save your own changes first, then `git pull --ff-only` and rebuild.
 
-## 4. First foreground run
+The test suite is mostly C++:
+
+- `core_test.cpp` covers the domain and FakeLinuxIo.
+- `network/control/uplink/peer_test.cpp` cover the network state machines.
+- `runtime_management_test.cpp` verifies degradation and in-memory state trimming.
+- `stress_test.cpp` verifies the concurrent queue.
+- Python scripts start the real process and test HTTP/TLS, signals, hot reload and fault injection.
+- The GPIO fake returns a real placeholder descriptor, verifying line values, failures, CLOEXEC and closure.
+- Electrical behavior requires hardware.
+
+## 3. First foreground run
 
 From the repository root:
 
@@ -89,11 +59,15 @@ mkdir -p var
   --sel var/sel.db --log var/faults.jsonl --interval-ms 20 --ticks 40
 tail -n 20 var/faults.jsonl
 python3 tools/bmc_manage.py --sel var/sel.db sel-info
+python3 tools/bmc_manage.py --sel var/sel.db sel-list
 ```
 
-Expect warning, critical, unavailable, and recovery transitions. Exit code 0 indicates a normal stop. Omit `--ticks` for continuous operation; press Ctrl+C to stop. Actions are simulated unless `--enable-actions` is present.
+- The mock sequence produces state transitions, rule and recovery records.
+- 0 means a normal exit; drop `--ticks` to run continuously and press Ctrl+C to stop.
+- Without `--enable-actions` fan actions are dry-run.
+- With no rules configured a warning is recorded and threshold monitoring continues.
 
-## 5. Source Release installation
+## 4. Source Release installation
 
 ```sh
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DBMC_TLS=ON
@@ -105,11 +79,12 @@ systemctl is-active bmc-lite.service
 sudo journalctl -u bmc-lite.service -n 30 --no-pager
 ```
 
-Installation creates the service account, installs the daemon/configuration/management tool under `/opt/bmc-lite`, and creates `/var/log/bmc-lite`. The first configuration is mock mode despite the filename `hardware.conf`. Existing configuration and rules are preserved. The installer refuses to replace a running daemon.
+- Installation creates the `bmc-lite` account and puts the program, configuration and tools under `/opt/bmc-lite`, with logs under `/var/log/bmc-lite`.
+- The first `hardware.conf` is a runnable mock configuration; existing configuration and rules are preserved. The installer refuses to replace a running service, and systemd does not enable networking by default.
 
-## 6. Create or install a release archive
+## 5. Release archive deployment
 
-On the build machine, from the project root:
+On the build machine, package and send to the target:
 
 ```sh
 BMC_TLS=ON bash tools/package-release.sh
@@ -118,14 +93,15 @@ tar -tzf bmc-lite-release.tar.gz | head
 scp bmc-lite-release.tar.gz bmc-lite-release.tar.gz.sha256 user@192.168.124.128:/tmp/
 ```
 
-Alternatively, download both files from your actual GitHub Releases page. On the target:
+- If you download directly from Releases, both files must match. On the target:
 
 ```sh
 ssh user@192.168.124.128
 cd /tmp
 sha256sum -c bmc-lite-release.tar.gz.sha256
-tar -xzf bmc-lite-release.tar.gz
-cd bmc-lite-release
+mkdir -p ~/bmc-install
+tar -xzf bmc-lite-release.tar.gz -C ~/bmc-install
+cd ~/bmc-install/bmc-lite-release
 ldd build-release/bmc-lite
 ./build-release/bmc-lite --help
 sudo bash deploy/install.sh
@@ -133,9 +109,11 @@ sudo systemctl enable --now bmc-lite.service
 systemctl is-active bmc-lite.service
 ```
 
-Use a fresh extraction directory when installing a different version. Do not continue if checksum verification fails or `ldd` reports a missing library. The corrected package layout includes `build-release/bmc-lite`, exactly as expected by the installer.
+- Do not install if checksum verification fails; resolve `not found` entries from `ldd` first.
+- The Ubuntu 24.04 TLS package needs `libssl3t64`; the target needs neither a compiler nor GoogleTest.
+- Use a fresh extraction directory when upgrading, so old files are not mixed in.
 
-## 7. Everyday operation
+## 6. Inspection and hot reload after deployment
 
 ```sh
 sudo systemctl status bmc-lite.service --no-pager
@@ -145,9 +123,8 @@ sudo -u bmc-lite python3 /opt/bmc-lite/tools/bmc_manage.py --sel /var/log/bmc-li
 sudo -u bmc-lite python3 /opt/bmc-lite/tools/bmc_manage.py --sel /var/log/bmc-lite/sel.db sel-list
 ```
 
-Use `sel-get <id>` for an existing ID returned by `sel-list`; IDs are not guaranteed to start at 1 in an existing installation.
-
-Edit and validate configuration:
+- `sel-get ID` queries a real ID returned by `sel-list`; an existing installation does not necessarily start at 1.
+- The log directory is private; read it as the service account or root.
 
 ```sh
 sudo cp /opt/bmc-lite/config/hardware.conf /opt/bmc-lite/config/hardware.conf.bak
@@ -159,13 +136,14 @@ sudo systemctl kill --kill-whom=main --signal=HUP bmc-lite.service
 sudo journalctl -u bmc-lite.service -n 30 --no-pager
 ```
 
-Look for `validated generation`; a rejected reload leaves the previous in-memory configuration active. Restore the backup on disk if validation fails. Hardware availability is not validated by `--check-config`.
+- `validated generation` means the reload took effect.
+- A failed reload keeps the previous in-memory configuration; restore the disk file from the backup.
+- `--check-config` validates syntax and policy, not hardware availability.
+- A valid rule reload preserves confirmation state, and state for removed sensors is cleaned up.
 
-## 8. Configuration reference
+## 7. Configuration and hardware
 
-Sensor fields: `id backend path scale direction warning critical hysteresis debounce failure_limit action_path`.
-
-`high` means larger values are worse; `low` means smaller values are worse. `scale` converts raw units. `debounce` confirms threshold changes, `failure_limit` confirms read failures, and `hysteresis` prevents recovery oscillation. `-` disables PWM for the sensor.
+Each line: `id backend path scale direction warning critical hysteresis debounce failure_limit action_path [calibration]`.
 
 ```text
 cpu_temp mock 40,95,95,95,err,err,err,40,40,40 1 high 70 90 3 3 3 -
@@ -173,13 +151,19 @@ cpu_temp sysfs /sys/class/hwmon/hwmon0/temp1_input 0.001 high 70 90 3 3 3 -
 gpio_fault gpio /dev/gpiochip0,23,active-low 1 high 0.5 1 0 1 1 -
 ```
 
-Rules: `id sensor state confirmations clear_confirmations action`. States are warning/critical/unavailable; `*` matches all sensors independently. Actions are `increase_fan` and `inspect_device`. Confirmation counts apply to sampled state after the threshold engine has applied its own debounce. `inspect_device` acknowledges a request; it is not automatic device diagnosis.
+- `high` means larger values are worse, `low` the opposite.
+- scale converts units.
+- debounce confirms a state.
+- failure_limit confirms read failures.
+- hysteresis controls recovery lag.
+- `-` means no PWM.
+- The optional `gain[:offset][;raw=value;...]` calibration supports linear correction and piecewise interpolation.
 
-Do not assume that hwmon numbering is stable across boots. Generic I2C reads are unsigned SMBus words, not a driver for every temperature chip. GPIO v2 supports level polling; `--gpio` is a separate legacy sysfs edge input.
+Rules: `id sensor state confirmations clear_confirmations action`. States are warning/critical/unavailable; actions are increase_fan/inspect_device. `*` counts each sensor independently and confirms on every sample. inspect only records an inspection request.
 
-## 9. HTTP and metrics after installation
+## 8. Enable daemon HTTP
 
-The default service does not listen. Enable the daemon HTTP server with `sudo systemctl edit bmc-lite.service`:
+Run `sudo systemctl edit bmc-lite.service` and fill in:
 
 ```ini
 [Service]
@@ -191,56 +175,24 @@ ExecStart=/opt/bmc-lite/bmc-lite --config /opt/bmc-lite/config/hardware.conf --r
 sudo systemctl daemon-reload
 sudo systemctl restart bmc-lite.service
 curl -f http://127.0.0.1:8000/healthz
-curl -f http://127.0.0.1:8000/metrics
-```
-
-Samples should increase. Daemon metrics add connections, rejection reasons, requests by role/method/status, bytes and enabled control/uplink/peer counters. Sensor values represent recorded events. Combine optional features in one ExecStart override. Remote control requires TLS; see the control guide for authentication, audit and configured PWM write permissions.
-
-Alternatively, the Python utility can serve a stored SEL in a second terminal. Choose a different port if daemon HTTP is enabled:
-
-```sh
-sudo -u bmc-lite python3 /opt/bmc-lite/tools/bmc_manage.py \
-  --sel /var/log/bmc-lite/sel.db serve --port 8000
-```
-
-In another terminal:
-
-```sh
 curl -f http://127.0.0.1:8000/redfish/v1/
 curl -f http://127.0.0.1:8000/redfish/v1/Managers/BMC/LogServices/SEL/Entries
 curl -f http://127.0.0.1:8000/metrics
 ```
 
-Keep the HTTP terminal running; Ctrl+C stops it. To access from your workstation, open a third terminal on the workstation:
+- The `samples` field from healthz keeps increasing.
+- Metrics include recorded sensor states/values, active network connections, limit/timeout/parse rejections, requests by role/method/status, byte counters, and extension metrics from enabled modules.
+- This is not full standard Redfish/IPMI, and it does not emit every live sample.
+
+Workstation forwarding: `ssh -N -L 18000:127.0.0.1:8000 user@192.168.124.128`, then run `curl http://127.0.0.1:18000/metrics` in another terminal. The Python `bmc_manage.py ... serve --port 8000` can still read the SEL independently, but it cannot share the port with the daemon and has no daemon network metrics.
+
+## 9. Validation and troubleshooting
 
 ```sh
-ssh -N -L 18000:127.0.0.1:8000 user@192.168.124.128
-curl -f http://127.0.0.1:18000/metrics
-```
-
-Python HTTP is loopback-only, has no TLS/authentication or daemon network metrics. Neither interface implements full standard Redfish or IPMI.
-
-## 10. Controlled demonstration
-
-Keep mock mode, change its sequence from normal values to sustained critical values, validate, and reload. Observe a critical transition, rule activation, simulated recovery, and SEL records. Change the sequence back to normal and reload to observe recovery. Test invalid configuration using the integration tests instead of modifying the installed service unnecessarily:
-
-```sh
-ctest --test-dir build -R 'runtime_reload|fault_injection' --output-on-failure
-```
-
-## 11. Upgrade, rollback, and troubleshooting
-
-Back up the installed directory and stop the service through systemd before running the installer. The installer preserves configuration. Start the service, inspect journal output, and restore the backup if necessary. Never replace the executable while it is running.
-
-For `GLIBCXX` errors, compile on the target. For unavailable sensors, check paths/permissions. For SEL access errors, use the service account. For refused HTTP connections, check the daemon port option or Python service. Inspect `journalctl -u bmc-lite.service -b` and `systemctl cat bmc-lite.service` for startup errors.
-
-## 12. Validation and scope
-
-```sh
+sudo apt-get install -y valgrind strace
 bash tools/validate.sh normal
 bash tools/validate.sh sanitize
 bash tools/validate.sh stress
-sudo apt-get install -y valgrind
 bash tools/validate.sh valgrind
 bash tools/validate.sh tsan
 # If GCC TSan reports unexpected memory mapping and setarch is permitted:
@@ -248,4 +200,30 @@ BMC_TSAN_NO_ASLR=1 bash tools/validate.sh tsan
 bash tools/bench-writes.sh 50000
 ```
 
-This is not complete BMC firmware. SEL is a custom text format without CRC or power-loss atomicity guarantees: startup repairs a torn trailing record by truncating it and reports the discarded byte count, but a bit flip in the middle of the file is not detectable. Both the log and the SEL batch their writes through a persistent descriptor; neither terminates the daemon on a write failure. The log does not fsync by default (pass `sync = true` to the Logger constructor for per-record durability) and flushes its buffer into the current segment before rotating, while the SEL writes state transitions and recovery outcomes immediately with fdatasync. Real I2C/GPIO electrical behavior needs hardware or an appropriate QEMU model. See `docs/代码阅读指南.md` for the source reading order.
+- ASan/UBSan and TSan use different directories.
+- setarch only affects this test process and its children, not global configuration.
+
+Common problems and what to check:
+
+- For a service failure, look at `journalctl -u bmc-lite.service -b`.
+- For `unavailable` sensors, check paths and permissions.
+- For `GLIBCXX` errors, compile on the target.
+- For HTTP, check whether a port was enabled.
+- For control, check the token owner/mode 0640 and the certificate.
+- A failed network start keeps monitoring running and eventually exits with status 1.
+
+## 10. Upgrade and rollback
+
+```sh
+sudo systemctl stop bmc-lite.service
+sudo cp -a /opt/bmc-lite /opt/bmc-lite.backup
+sudo cp -a /var/log/bmc-lite /var/log/bmc-lite.backup
+# In the new release extraction directory or the source root:
+sudo bash deploy/install.sh
+sudo systemctl start bmc-lite.service
+sudo journalctl -u bmc-lite.service -n 30 --no-pager
+```
+
+- The installer preserves configuration; systemd overrides keep working.
+- To roll back, stop the service first, restore the backed-up program and configuration, then start it.
+- Never overwrite the binary while it is running.

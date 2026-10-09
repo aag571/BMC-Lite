@@ -1,6 +1,7 @@
 #include "bmc/monitor.hpp"
 #include <gtest/gtest.h>
 #include <filesystem>
+#include <fstream>
 #include <unistd.h>
 
 // 运行期自监控：日志与 SEL 的降级如何被计数并上报（含 5 秒节流，避免每 tick 刷屏），
@@ -13,7 +14,8 @@ class HealthLogger final : public bmc::EventLogger {
 public:
     std::uint64_t failures = 0, dropped = 0;
     unsigned writes = 0;
-    void write(const bmc::Event&) override { ++writes; }
+    std::vector<bmc::Event> events;
+    void write(const bmc::Event& event) override { ++writes; events.push_back(event); }
     void action(const std::string&, const std::string&) override { ++writes; }
     std::uint64_t write_failures() const override { return failures; }
     std::uint64_t dropped_bytes() const override { return dropped; }
@@ -21,6 +23,48 @@ public:
 // 每个用例独占的文件名，避免并行执行时互相踩踏。
 std::filesystem::path storage(const std::string& suffix) {
     return std::filesystem::temp_directory_path() / ("bmc-runtime-management-" + std::to_string(::getpid()) + suffix);
+}
+TEST(RuntimeManagement, ConfiguredCalibrationReachesThresholdAndSel) {
+    const auto config_path = storage("-calibration.conf");
+    const auto sel_path = storage("-calibration.sel");
+    std::filesystem::remove(sel_path);
+    {
+        std::ofstream config(config_path);
+        config << "cpu mock 45,err 1 high 70 85 3 1 1 - 2;0=0;100=100\n";
+    }
+    auto sensors = bmc::prepare_sensors(config_path.string(), bmc::system_io());
+    bmc::SelStore sel(sel_path);
+    bmc::EventBus bus;
+    bmc::Worker worker(4, 1);
+    bmc::FaultRuleEngine rules({});
+    bmc::RecoveryPolicyEngine recovery([](const bmc::RecoveryRequest&) { return true; });
+    bmc::Monitor monitor;
+    HealthLogger logger;
+    std::atomic_bool failed{false};
+    monitor.poll(sensors, logger, worker, bus, rules, recovery, sel, failed);
+    monitor.poll(sensors, logger, worker, bus, rules, recovery, sel, failed);
+    worker.stop(); bus.stop();
+    ASSERT_EQ(logger.events.size(), 2u);
+    ASSERT_TRUE(logger.events[0].value);
+    EXPECT_DOUBLE_EQ(*logger.events[0].value, 90);
+    EXPECT_EQ(logger.events[0].after, bmc::State::critical);
+    EXPECT_FALSE(logger.events[1].value);
+    EXPECT_EQ(logger.events[1].after, bmc::State::unavailable);
+    const auto history = sel.query();
+    ASSERT_GE(history.size(), 2u);
+    ASSERT_TRUE(history[0].value);
+    EXPECT_DOUBLE_EQ(*history[0].value, 90);
+    std::filesystem::remove(config_path);
+    std::filesystem::remove(sel_path);
+}
+TEST(RuntimeManagement, CalibrationOverflowBecomesReadFailure) {
+    bmc::Config config;
+    config.id = "cpu";
+    config.backend = "mock";
+    config.path = "1e308";
+    config.calibration.gain = 10;
+    bmc::MonitorSensor sensor(config, bmc::system_io());
+    EXPECT_FALSE(sensor.read_value());
 }
 }
 // 同一失败在 5 秒窗口内只上报一次；窗口外仍有新失败才再记一条，且上报本身不反写日志。

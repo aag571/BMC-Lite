@@ -12,6 +12,13 @@ struct MonitorSensor {
     bmc::Engine engine;
     MonitorSensor(bmc::Config value, LinuxIo& io)
         : config(std::move(value)), device(bmc::make_device(config, io)), engine(config) {}
+    // Reader 已完成 backend scale；此处再应用用户标定，失败样本保持空值。
+    std::optional<double> read_value() {
+        const auto value = device->read_value();
+        if (!value) return std::nullopt;
+        try { return bmc::apply(config.calibration, *value); }
+        catch (const std::invalid_argument&) { return std::nullopt; }
+    }
 };
 
 // Monitor 管理一次采样的业务流程；不认识 epoll、timerfd 或 Linux 信号。

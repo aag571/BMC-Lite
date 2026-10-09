@@ -14,6 +14,9 @@ double apply(const Calibration& calibration, double raw) {
     }
     // 顺序不可交换：校准点定义在线性修正之后的量纲上，查表前必须先做这一步换算。
     const double corrected = raw * calibration.gain + calibration.offset;
+    if (!std::isfinite(corrected)) {
+        throw std::invalid_argument("non-finite calibrated value");
+    }
     // 没有校准点即纯线性转换，与只配置 scale 的行为一致。
     if (calibration.points.empty()) {
         return corrected;

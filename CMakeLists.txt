@@ -8,7 +8,7 @@ option(BMC_TSAN "Enable ThreadSanitizer" OFF)
 option(BMC_TLS "Enable OpenSSL 3 control HTTPS" OFF)
 find_package(Threads REQUIRED)
 add_library(bmc_core src/sel.cpp src/state.cpp src/event_bus.cpp src/fd.cpp
-  src/config.cpp src/rules.cpp src/recovery.cpp src/engine.cpp src/readers.cpp
+  src/config.cpp src/rules.cpp src/rules_loader.cpp src/recovery.cpp src/engine.cpp src/readers.cpp
   src/logger.cpp src/worker.cpp src/actions.cpp src/monitor.cpp src/linux_io.cpp
   src/calibration.cpp src/chips.cpp src/cli.cpp src/socket_io.cpp src/http.cpp src/json.cpp src/service.cpp src/network.cpp src/control.cpp src/tls.cpp src/uplink.cpp src/peer.cpp)
 target_include_directories(bmc_core PUBLIC include)

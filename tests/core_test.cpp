@@ -359,6 +359,12 @@ TEST(Calibration, DefaultIsIdentityAndLinearTermsApply) {
     EXPECT_DOUBLE_EQ(bmc::apply(linear, 10), 17);
     EXPECT_THROW(bmc::apply(identity, std::numeric_limits<double>::quiet_NaN()), std::invalid_argument);
 }
+TEST(Rules, ParsesTextWithoutFileAccess) {
+    const auto rules = bmc::parse_rules("# comment\ncritical cpu critical 2 3 inspect_device\n");
+    ASSERT_EQ(rules.size(), 1u);
+    EXPECT_EQ(rules[0].id, "critical");
+    EXPECT_THROW(bmc::parse_rules("broken rule\n"), std::invalid_argument);
+}
 TEST(Calibration, InterpolatesBetweenPointsAndClampsOutside) {
     bmc::Calibration calibration;
     calibration.points = {{0, 100}, {10, 200}, {20, 260}};

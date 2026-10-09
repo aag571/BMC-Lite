@@ -1,8 +1,8 @@
 #include "bmc/core.hpp"
 #include <algorithm>
 #include <set>
-#include <unordered_set>
 #include <sstream>
+#include <unordered_set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -29,12 +29,10 @@ void validate_rules(const std::vector<FaultRule>& rules) {    std::set<std::stri
     }
 }
 }
-// 解析规则文件：每行固定 6 个字段 id sensor state confirmations clear_confirmations action；
-// state 只接受 warning/critical/unavailable，空行与 # 开头的行跳过，文件缺失直接抛错。
-std::vector<FaultRule> load_rules(const std::filesystem::path& path) {
-    std::ifstream input(path);
-    if (!input) throw std::runtime_error("cannot open rules: " + path.string());
+// 纯文本规则解析；不打开文件，因此领域测试不需要文件系统。
+std::vector<FaultRule> parse_rules(std::string_view text) {
     std::vector<FaultRule> rules; std::set<std::string> ids; std::string line;
+    std::istringstream input{std::string(text)};
     while (std::getline(input, line)) {
         if (line.empty() || line.front() == '#') continue;
         FaultRule rule; std::string state; std::istringstream fields(line);

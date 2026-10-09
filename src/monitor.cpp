@@ -25,7 +25,7 @@ void Monitor::poll(std::vector<MonitorSensor>& sensors, bmc::EventLogger& logger
     for (auto& sensor : sensors) {
         // 每次采样都评估规则，只有状态变化才写入故障历史，避免日志无限重复。
         // 读取失败以 nullopt 表示，由 Engine 累计到 failure_limit 后转成 unavailable。
-        const auto value = sensor.device->read_value();
+        const auto value = sensor.read_value();
         const auto transition = sensor.engine.update(value);
         // 没有迁移时也要造一个"当前状态"事件：规则确认需要每个周期的状态快照，
         // 否则连续 critical 不产生新事件，confirmations 大于 1 的规则永远无法触发。

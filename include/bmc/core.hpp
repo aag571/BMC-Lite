@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -197,6 +198,8 @@ private:
     std::unordered_map<std::string, Runtime> runtime_;
 };
 // 解析规则文件。文件打不开抛出 std::runtime_error，非法或重复规则抛出 std::invalid_argument。
+// 纯文本解析留在领域层；文件打开由应用层的 load_rules 负责。
+std::vector<FaultRule> parse_rules(std::string_view text);
 std::vector<FaultRule> load_rules(const std::filesystem::path& path);
 // 一次恢复动作的值类型请求；path 是动作目标（如 PWM 节点），由规则携带而非从设备查出。
 struct RecoveryRequest { std::string rule; std::string sensor; std::string action; std::uint64_t sequence; std::string path; };
